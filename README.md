@@ -1,16 +1,14 @@
 # Cinema — Personal Movie & TV Series Library
 
+<div align='center'>
 <p>
-  <img width="1280" src="https://i.imgur.com/Oeae7ZO.jpeg" />
+  <img width="720" src="https://i.imgur.com/Oeae7ZO.jpeg" />
 </p>
 
 <p>
-  <img width="1280" src="https://i.imgur.com/acWJCVj.png" />
+  <img width="480" src="https://i.imgur.com/acWJCVj.png" /> <img width="480" src="https://i.imgur.com/CzeDl06.png" />
 </p>
-
-<p>
-  <img width="1280" src="https://i.imgur.com/CzeDl06.png" />
-</p>
+</div>
 
 A dark, media-centre-style desktop app that scans your local folders and shows
 your movies and series in a poster grid, with detailed series/episode views.
@@ -60,9 +58,11 @@ the app with these tabs:
 * **Wikiquote** — the quotes of the films in your library.
 * **Library Health** — what is wrong with the library, and how big it is.
 
+<div align='center'>
 <p>
-  <img width="1280" src="https://i.imgur.com/FV0moWo.png" />
+  <img width="480" src="https://i.imgur.com/FV0moWo.png" />
 </p>
+</div>
 
 Everything is stored in `settings.json`, written on first start:
 
