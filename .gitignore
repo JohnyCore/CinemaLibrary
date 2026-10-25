@@ -1,0 +1,8 @@
+# local setting overrides and app data are machine-specific
+settings.json
+data/
+**/__pycache__/
+*.pyc
+
+# generated analysis artifacts
+graphify-out/

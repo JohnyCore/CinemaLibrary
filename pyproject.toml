@@ -1,0 +1,18 @@
+[project]
+name = "cinema"
+version = "1.0.0"
+description = "A local media library browser (Tkinter + SQLite + Pillow)"
+requires-python = ">=3.11"
+dependencies = ["Pillow>=10.0"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+exclude = ["data", "graphify-out", "__pycache__"]
+
+[tool.ruff.lint]
+# the checks the smoke test relies on: pyflakes errors + syntax errors
+select = ["F", "E9"]
+
+[tool.ruff.lint.per-file-ignores]
+"tools/smoke_test.py" = ["E402"]
