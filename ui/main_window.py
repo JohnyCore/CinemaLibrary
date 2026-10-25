@@ -13,6 +13,7 @@ from typing import Callable
 
 import config
 from database.db_manager import Database
+from metadata.person_profiles import fetch_person_profile, person_key
 from scanner.library_scanner import scan
 from ui.details_view import DetailsView
 from ui.dialogs import ConfirmDialog, PopupMenu, PromptDialog
@@ -185,6 +186,7 @@ class MainWindow(tk.Frame):
         self._chip_kind: str | None = None
         self._chip_value: str | None = None
         self._collections: list[dict] = []
+        self._person_profile_generation = 0
 
         setup_styles(root)
 
@@ -323,7 +325,7 @@ class MainWindow(tk.Frame):
         self._details = DetailsView(
             body, self._images, self._show_library, self._db,
             self._on_item_fetched, self._on_filter_from_details,
-            post=self._post,
+            post=self._post, on_person=self._show_person_profile,
         )
         self._library = LibraryView(body, self._images, self._open_item,
                                     self._show_context_menu)
@@ -797,6 +799,44 @@ class MainWindow(tk.Frame):
         self._show_library()
         self._set_section("all")
         self._set_chip(kind, value)
+
+    def _show_person_profile(self, name: str, role: str) -> None:
+        """Show a person's cached or freshly fetched profile beside the grid."""
+        self._show_library()
+        self._set_section("all")
+        self._set_chip(role, name)
+        self._person_profile_generation += 1
+        generation = self._person_profile_generation
+        key = person_key(name)
+        profile = self._db.get_person_profile(key)
+        if profile is not None:
+            self._library.show_person_profile(name, role, profile)
+            return
+
+        self._library.show_person_profile(name, role, status="Looking up Wikipedia…")
+
+        def worker() -> None:
+            error = None
+            try:
+                result = fetch_person_profile(name, role, config.PEOPLE_CACHE_DIR)
+                self._db.save_person_profile(result)
+            except Exception as exc:
+                log.warning("Wikipedia profile lookup failed for %s: %s", name, exc)
+                error = str(exc)
+
+            def apply() -> None:
+                if generation != self._person_profile_generation:
+                    return
+                profile = self._db.get_person_profile(key)
+                if profile is not None:
+                    self._library.show_person_profile(name, role, profile)
+                else:
+                    self._library.show_person_profile(
+                        name, role, status=f"Could not load Wikipedia profile: {error}")
+
+            self._post(apply)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _set_chip(self, kind: str, value: str) -> None:
         self._chip_kind = kind

@@ -64,6 +64,8 @@ class ScrollArea(tk.Frame):
         return (x, y, width, max(height, self.canvas.winfo_height()))
 
     def _on_inner(self, _event=None) -> None:
+        self.canvas.itemconfigure(self._window,
+                                  height=self.inner.winfo_reqheight())
         self.canvas.configure(scrollregion=self._scrollregion())
         self._update_scrollbar()
 
@@ -94,6 +96,14 @@ class ScrollArea(tk.Frame):
                                   height=self.inner.winfo_reqheight())
         self.canvas.configure(scrollregion=self._scrollregion())
         self._update_scrollbar()
+
+    def scroll_to_top(self) -> None:
+        """Cancel pending smooth scrolling and return to the start."""
+        if self._smooth_job is not None:
+            self.after_cancel(self._smooth_job)
+            self._smooth_job = None
+        self._smooth_target = None
+        self.canvas.yview_moveto(0)
 
     def _on_wheel(self, event) -> None:
         """Scroll this region when the pointer is over it."""

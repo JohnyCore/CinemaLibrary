@@ -637,6 +637,40 @@ def summary(title: str) -> str | None:
     return data.get("extract")
 
 
+def person_profile(name: str, role: str) -> dict[str, str | None] | None:
+    """Find a person's Wikipedia lead and thumbnail using their name and role."""
+    role_term = {
+        "cast": "actor",
+        "director": "film director",
+        "writer": "screenwriter",
+    }.get(role, "")
+    data = _api({
+        "action": "query",
+        "list": "search",
+        "srsearch": f'"{name}" {role_term}'.strip(),
+        "srlimit": 1,
+        "format": "json",
+        "utf8": 1,
+    })
+    results = data.get("query", {}).get("search", [])
+    if not results:
+        return None
+    title = results[0].get("title")
+    if not title:
+        return None
+    page = _get(_SUMMARY + urllib.parse.quote(title.replace(" ", "_")), gap=0.0)
+    extract = page.get("extract")
+    if not extract:
+        return None
+    return {
+        "title": page.get("title") or title,
+        "extract": extract,
+        "thumbnail": (page.get("thumbnail") or {}).get("source"),
+        "url": (page.get("content_urls") or {}).get("desktop", {}).get("page")
+                or article_url(title),
+    }
+
+
 def article_url(title: str) -> str | None:
     if not title:
         return None

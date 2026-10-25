@@ -6,3 +6,4 @@ data/
 
 # generated analysis artifacts
 graphify-out/
+RELEASE_NOTES.md

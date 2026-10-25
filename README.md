@@ -1,5 +1,15 @@
 # Cinema — Personal Movie & TV Series Library
 
+<div align='center'>
+<p>
+  <img width="720" src="https://i.imgur.com/Oeae7ZO.jpeg" />
+</p>
+
+<p>
+  <img width="480" src="https://i.imgur.com/acWJCVj.png" /> <img width="480" src="https://i.imgur.com/CzeDl06.png" />
+</p>
+</div>
+
 A dark, media-centre-style desktop app that scans your local folders and shows
 your movies and series in a poster grid, with detailed series/episode views.
 It runs fully offline; an optional metadata provider (Cinemeta) can be
@@ -34,8 +44,9 @@ the app with these tabs:
 * **General** — the two library folders (Browse dialogs), *Clear Thumbnail
   Cache*, *Prune Stale Thumbnails*, and the name of the connected metadata
   provider.
-* **Bulk Fetch** — every item that has no metadata yet, with *Fetch Selected*,
-  *Fetch All*, a progress bar and a **Stop** button.
+* **Bulk Fetch** — separate *Movies & Series* and optional *People Profiles*
+  lists. People profiles come from Wikipedia and are cached with their
+  biographies and photos for offline reading.
 * **Metadata Editor** — every item with its metadata badges; you can remove
   metadata, poster, backdrop or `about.txt` for the selected rows (each
   removal asks for confirmation first).
@@ -47,6 +58,12 @@ the app with these tabs:
   story, with the story to read (see below).
 * **Wikiquote** — the quotes of the films in your library.
 * **Library Health** — what is wrong with the library, and how big it is.
+
+<div align='center'>
+<p>
+  <img width="480" src="https://i.imgur.com/FV0moWo.png" />
+</p>
+</div>
 
 Everything is stored in `settings.json`, written on first start:
 
@@ -101,6 +118,9 @@ later (never keys in source code).
   where every episode has its own **play** and **watched** button (the
   seasons collapse, the rows are only built while a season is open), plus
   *Open Folder* (Esc = back)
+- Click a cast, director or writer name to see its Wikipedia profile in a
+  reading pane beside the filtered library results; fetched profiles remain
+  available offline
 - Every popup (the metadata chooser, the confirmation dialogs, the poster
   viewer, the context menu) opens in the middle of the app window and is
   drawn in the dark theme, including the Windows title bar

@@ -9,10 +9,12 @@ from tkinter import font as tkfont
 from pathlib import Path
 from typing import Callable
 
+from PIL import Image, ImageTk
+
 from database.db_manager import Database
 from metadata import metadata_service
 from utils import media_ops
-from utils.image_cache import ImageCache, ImageJob, bucket_size
+from utils.image_cache import ImageCache, ImageJob
 from utils.image_utils import find_artwork
 from ui.window_utils import ScrollArea, setup_popup
 from ui.icons import font as icon_font, glyph as icon_glyph
@@ -28,6 +30,8 @@ MUTED = "#9aa4b2"
 ACCENT = "#e5484d"
 LINK = "#6aa4ff"
 POSTER_BG = "#0f1216"
+PANEL_TINT = "#121a27"
+PANEL_TINT_STRENGTH = 0.68
 
 TREE_STYLE = "Dark.Treeview"
 
@@ -46,18 +50,21 @@ BTN_SMALL = dict(
 class DetailsView(tk.Frame):
     def __init__(self, master, images: ImageCache, on_back, db: Database,
                   on_fetched=None, on_filter=None,
-                  post: Callable[[Callable[[], None]], None] | None = None) -> None:
+                  post: Callable[[Callable[[], None]], None] | None = None,
+                  on_person=None) -> None:
         super().__init__(master, bg=BG)
         self._images = images
         self._on_back = on_back
         self._db = db
         self._on_fetched = on_fetched
         self._on_filter = on_filter
+        self._on_person = on_person
         self._post = post or (lambda fn: self.after(0, fn))
         self._item: dict | None = None
         self._bg_job: ImageJob | None = None
         self._poster_job: ImageJob | None = None
         self._bg_id: int | None = None
+        self._bg_image = None
         self._poster_id: int | None = None
         self._poster_img_id: int | None = None
         self._resize_job: str | None = None
@@ -91,6 +98,11 @@ class DetailsView(tk.Frame):
                         relheight=0.88)
         self.info.grid_columnconfigure(0, weight=1)
         self.info.grid_rowconfigure(0, weight=1)
+        self._panel_backdrop = tk.Canvas(
+            self.info, bg=PANEL_BG, highlightthickness=0, bd=0,
+        )
+        self._panel_backdrop.place(relx=0, rely=0, relwidth=1, relheight=1)
+        self._panel_backdrop_image = None
         # The panel has three rows: the top part scrolls (a series keeps its
         # plot, facts and episode browser in that one scroll), the buttons
         # and the location are pinned. Nothing below the scroll can clip or
@@ -168,6 +180,9 @@ class DetailsView(tk.Frame):
                 # the buttons and the episode list stayed - bring their
                 # values in line with the new facts
                 self._update_panel(item)
+            self._upper.update_scrollregion()
+            if not same_item:
+                self._upper.scroll_to_top()
         except Exception:
             # a half-built panel is worse than an honest error message
             log.exception("could not build the details panel for %s", item.get("title"))
@@ -189,6 +204,7 @@ class DetailsView(tk.Frame):
         poster.pack(side="left", padx=(0, 16))
         poster.bind("<Button-1>", lambda _e: self._enlarge_poster())
         self._poster_v = poster
+        self._panel["poster_canvas"] = poster
         self._load_poster(poster)
 
         head = tk.Frame(top, bg=PANEL_BG)
@@ -198,15 +214,13 @@ class DetailsView(tk.Frame):
             font=("Segoe UI Semibold", 20), wraplength=320, justify="left")
         title_label.pack(anchor="w")
         self._panel["title"] = title_label
-        parts = [str(p) for p in self._meta_line(item) if p]
-        meta_label = tk.Label(head, text="  ·  ".join(parts), bg=PANEL_BG, fg=MUTED,
-                              font=("Segoe UI", 10))
-        if parts:
-            meta_label.pack(anchor="w", pady=(4, 0))
+        meta_label = tk.Frame(head, bg=PANEL_BG)
+        self._fill_meta_line(meta_label, item)
         self._panel["meta"] = meta_label
         genres_bar = tk.Frame(head, bg=PANEL_BG)
         self._panel["genres"] = genres_bar
         self._fill_genres(genres_bar, item)
+        self._credits(head, item)
         folder = item.get("collection_name")
         if folder:
             tk.Label(head, text=f"Folder:  {folder}", bg=PANEL_BG, fg=MUTED,
@@ -215,9 +229,15 @@ class DetailsView(tk.Frame):
         # one panel for both: the facts live in the scroll flow under the
         # header - a series-like cramped column next to the poster clips its
         # rows beyond the scroll edge, so nothing is pinned beside it any more
-        tk.Frame(inner, height=1, bg=BORDER).pack(fill="x", pady=(14, 0))
-        self._stacked(inner, item)
-        self._facts(inner, item)
+        overview = tk.Frame(inner, bg=PANEL_BG)
+        tk.Label(
+            overview, text="OVERVIEW", bg=PANEL_BG, fg=MUTED,
+            font=("Segoe UI", 8, "bold"),
+        ).pack(anchor="w", pady=(12, 5))
+        tk.Frame(overview, height=1, bg=BORDER).pack(fill="x")
+        self._stacked(overview, item)
+        self._facts(overview, item)
+        overview.pack(fill="x")
         if is_series:
             # the whole body shares the one scroll: the meta is the first
             # thing the page shows, the episodes follow under it
@@ -262,13 +282,7 @@ class DetailsView(tk.Frame):
             label.configure(text=item.get("title") or "Untitled")
         label = panel.get("meta")
         if label is not None:
-            parts = [str(p) for p in self._meta_line(item) if p]
-            text = "  ·  ".join(parts)
-            if text:
-                label.configure(text=text)
-                label.pack(anchor="w", pady=(4, 0))
-            else:
-                label.pack_forget()
+            self._fill_meta_line(label, item)
         label = panel.get("plot")
         if label is not None:
             text = str(item.get("plot") or "").strip()
@@ -277,14 +291,6 @@ class DetailsView(tk.Frame):
                 label.pack(anchor="w", pady=(12, 0))
             else:
                 label.pack_forget()
-        frame = panel.get("imdb")
-        if frame is not None:
-            imdb_id = str(item.get("imdb_id") or "")
-            if imdb_id.startswith("tt"):
-                panel["imdb_link"].configure(text=imdb_id)
-                frame.pack(anchor="w", pady=(panel.get("pady", 9), 0))
-            else:
-                frame.pack_forget()
         bar = panel.get("genres")
         if bar is not None:
             self._fill_genres(bar, item)
@@ -311,19 +317,54 @@ class DetailsView(tk.Frame):
                 self._images.cancel(job)
                 setattr(self, attr, None)
 
-    def _meta_line(self, item: dict) -> list[str]:
+    def _meta_line(self, item: dict) -> list[tuple[str, str | None]]:
         parts = []
         if item.get("year"):
-            parts.append(str(item["year"]))
-        parts.append("Series" if item.get("media_type") == "series" else "Movie")
+            parts.append((str(item["year"]), None))
+        parts.append(("Series" if item.get("media_type") == "series" else "Movie", None))
         runtime = item.get("runtime")
         if runtime:
-            parts.append(f"{runtime // 60}h {runtime % 60:02d}m" if runtime >= 60 else f"{runtime}m")
+            parts.append((
+                f"{runtime // 60}h {runtime % 60:02d}m"
+                if runtime >= 60 else f"{runtime}m",
+                None,
+            ))
         if item.get("rating") is not None:
-            parts.append(f"★ {item['rating']:.1f}")
+            parts.append((f"{item['rating']:.1f}", "star"))
         if item.get("media_type") == "series" and item.get("episodes_total"):
-            parts.append(f"{item.get('episodes_watched', 0)}/{item['episodes_total']} watched")
+            parts.append((
+                f"{item.get('episodes_watched', 0)}/{item['episodes_total']} watched",
+                None,
+            ))
         return parts
+
+    def _fill_meta_line(self, row: tk.Frame, item: dict) -> None:
+        for child in row.winfo_children():
+            child.destroy()
+        parts = self._meta_line(item)
+        if not parts:
+            row.pack_forget()
+            return
+        for index, (text, icon) in enumerate(parts):
+            if index:
+                tk.Label(row, text="·", bg=PANEL_BG, fg=MUTED,
+                         font=("Segoe UI", 10)).pack(side="left", padx=6)
+            if icon:
+                tk.Label(row, text=icon_glyph(icon), bg=PANEL_BG, fg="#e0a33e",
+                         font=icon_font(9)).pack(side="left", padx=(0, 3))
+            imdb_id = str(item.get("imdb_id") or "")
+            if icon == "star" and imdb_id.startswith("tt"):
+                tk.Button(
+                    row, text=text,
+                    command=lambda value=imdb_id: self._open_imdb(value),
+                    bg=PANEL_BG, fg=LINK, activebackground=PANEL_BG,
+                    activeforeground=LINK, bd=0, padx=0, pady=0,
+                    font=("Segoe UI", 10), cursor="hand2",
+                ).pack(side="left")
+            else:
+                tk.Label(row, text=text, bg=PANEL_BG, fg=MUTED,
+                         font=("Segoe UI", 10)).pack(side="left")
+        row.pack(anchor="w", pady=(4, 0))
 
     def _stacked(self, inner: tk.Frame, item: dict) -> None:
         """The plot, in the full width of the panel."""
@@ -342,29 +383,25 @@ class DetailsView(tk.Frame):
         return max(240, self._panel_width() - 32)
 
     def _facts(self, parent: tk.Frame, item: dict) -> None:
-        """IMDb, the names, the country and the personal rating."""
-        width = self._full_width()
+        """The personal rating and release date."""
         pady = 9
         # the rows are packed again when the panel is updated - they have to
         # keep the margin they were built with, or the panel jumps
         self._panel["pady"] = pady
-        imdb_id = str(item.get("imdb_id") or "")
-        frame = tk.Frame(parent, bg=PANEL_BG)
-        link = self._link(frame, imdb_id, lambda: self._open_imdb(imdb_id))
-        tk.Label(frame, text="IMDb:", bg=PANEL_BG, fg=MUTED,
-                 font=("Segoe UI", 9)).pack(side="left", padx=(0, 4))
-        link.pack(side="left")
-        if imdb_id.startswith("tt"):
-            frame.pack(anchor="w", pady=(pady, 0))
-        self._panel["imdb"] = frame
-        self._panel["imdb_link"] = link
         truth = tk.Label(parent, text="Based on a true story", bg=PANEL_BG,
                          fg=ACCENT, font=("Segoe UI", 9, "bold"))
         truth.pack(anchor="w", pady=(pady, 0))
         self._panel["truestory"] = truth
         if not item.get("true_story"):
             truth.pack_forget()
-        self._rating_row(parent, item, pady)
+
+        release = self._fmt_date(item.get("release_date"))
+        if release:
+            self._fact_row(parent, "Released", release, pady)
+
+    def _credits(self, parent: tk.Frame, item: dict) -> None:
+        """Show director, writer, cast and country beneath the genre links."""
+        width = max(180, self._full_width() - 164)
         rows: list[tuple[str, list[str], str, bool]] = []
         if item.get("director"):
             label = "Created by" if item.get("media_type") == "series" else "Director"
@@ -379,10 +416,8 @@ class DetailsView(tk.Frame):
             rows.append(("Country", self._split_names(item["country"]), "country", False))
         for title, names, kind, truncated in rows:
             self._names_row(parent, title, names, kind, truncated,
-                            width=width, pady=pady)
-        release = self._fmt_date(item.get("release_date"))
-        if release:
-            self._fact_row(parent, "Released", release, pady)
+                            width=width, pady=4)
+        self._rating_row(parent, item, pady=4)
 
     @staticmethod
     def _fmt_date(value) -> str:
@@ -406,15 +441,16 @@ class DetailsView(tk.Frame):
     def _rating_row(self, parent: tk.Frame, item: dict, pady: int = 9) -> None:
         """The five stars of the personal rating."""
         row = tk.Frame(parent, bg=PANEL_BG)
-        tk.Label(row, text="Your rating:", bg=PANEL_BG, fg=MUTED,
+        tk.Label(row, text="Your Rating:", bg=PANEL_BG, fg=MUTED,
                  font=("Segoe UI", 9)).pack(side="left", padx=(0, 6))
         stars: list[tk.Button] = []
         for number in range(1, 6):
             button = tk.Button(
-                row, text="★", command=lambda n=number: self._rate(n),
+                row, text=icon_glyph("star"),
+                command=lambda n=number: self._rate(n),
                 bg=PANEL_BG, fg="#e0a33e", activebackground=PANEL_BG,
                 activeforeground="#f2c069", bd=0, padx=1, pady=0,
-                font=("Segoe UI", 12), cursor="hand2")
+                font=icon_font(12), cursor="hand2")
             button.pack(side="left")
             stars.append(button)
         tk.Label(row, text="  (click again to clear)", bg=PANEL_BG, fg=MUTED,
@@ -461,6 +497,17 @@ class DetailsView(tk.Frame):
         lines: list[list[tuple[str, bool]]] = []
         current: list[tuple[str, bool]] = []
         used = 0
+        icon_name = {
+            "director": "film",
+            "writer": "pen",
+            "cast": "users",
+            "country": "globe",
+        }.get(kind)
+        header_text = icon_glyph(icon_name) if icon_name else f"{title}:"
+        header_width = (
+            icon_font(10).measure(header_text)
+            if icon_name else self._measure(header_text)
+        )
         for text, is_link in entries:
             need = (self._measure(text) + 16) if is_link else 18
             if current and used + need > width:
@@ -475,13 +522,20 @@ class DetailsView(tk.Frame):
         for index, line in enumerate(lines):
             row = tk.Frame(container, bg=PANEL_BG)
             if index == 0:
-                tk.Label(row, text=f"{title}:", bg=PANEL_BG, fg=MUTED,
-                         font=("Segoe UI", 9)).pack(side="left", padx=(0, 4))
+                tk.Label(
+                    row, text=header_text, bg=PANEL_BG, fg=MUTED,
+                    font=icon_font(10) if icon_name else ("Segoe UI", 9),
+                ).pack(side="left", padx=(0, 4))
             for pos, (text, is_link) in enumerate(line):
                 if is_link:
                     self._link(
                         row, text,
-                        lambda k=kind, n=text: self._dispatch_filter(k, n),
+                        lambda k=kind, n=text: (
+                            self._on_person(n, k)
+                            if self._on_person is not None
+                            and k in ("cast", "director", "writer")
+                            else self._dispatch_filter(k, n)
+                        ),
                         wraplength=180,
                     ).pack(side="left", padx=(0, 2))
                 else:
@@ -493,8 +547,7 @@ class DetailsView(tk.Frame):
             if index:
                 # the wrapped lines line up under the value column, not
                 # under the label - the facts read as a grid
-                row.pack(anchor="w",
-                         padx=(self._measure(title + ":") + 4, 0))
+                row.pack(anchor="w", padx=(header_width + 4, 0))
             else:
                 row.pack(anchor="w")
         container.pack(anchor="w", pady=(pady, 0))
@@ -996,7 +1049,6 @@ class DetailsView(tk.Frame):
         self._update_season_label(name)
         # the list is shorter or longer now - the flow region follows
         self._upper.update_scrollregion()
-
     def _toggle_episode(self, path: str) -> None:
         """Mark one episode as watched or unwatched."""
         episode = self._ep_by_path.get(path)
@@ -1020,13 +1072,7 @@ class DetailsView(tk.Frame):
         pass
 
     def _load_backdrop(self) -> None:
-        """Request the backdrop at the size the canvas actually has.
-
-        The panel is built before it is packed, so the first request would
-        otherwise use the fallback size and stretch a small image over the
-        whole canvas. The size is bucketed, so the disk cache holds one
-        file per bucket instead of one per window size.
-        """
+        """Request a backdrop rendered to the canvas's current dimensions."""
         width = self.canvas.winfo_width()
         height = self.canvas.winfo_height()
         if width < 2 or height < 2:
@@ -1039,14 +1085,13 @@ class DetailsView(tk.Frame):
         if self._bg_job is not None:
             self._images.cancel(self._bg_job)
             self._bg_job = None
-        if self._bg_id is not None:
-            self.canvas.delete(self._bg_id)
-            self._bg_id = None
         self._last_geo = (width, height)
         item = self._item or {}
         source = item.get("poster2_path") or item.get("poster_path")
         self._bg_job = self._images.get_backdrop(
-            source, bucket_size(width, height), self._apply_bg, priority=0)
+            source, (width, height), self._apply_bg, priority=0,
+            disk_cache=False,
+        )
 
     def _apply_bg(self, image) -> None:
         if not self.winfo_exists() or image is None:
@@ -1059,6 +1104,30 @@ class DetailsView(tk.Frame):
         else:
             self.canvas.itemconfig(self._bg_id, image=image)
         self.canvas.tag_lower(self._bg_id)
+        self._refresh_panel_backdrop()
+
+    def _refresh_panel_backdrop(self) -> None:
+        """Draw a tinted crop of the backdrop behind the panel's widgets."""
+        if self._bg_image is None or not self.info.winfo_ismapped():
+            return
+        width, height = self.info.winfo_width(), self.info.winfo_height()
+        canvas_width, canvas_height = self.canvas.winfo_width(), self.canvas.winfo_height()
+        if min(width, height, canvas_width, canvas_height) < 2:
+            return
+
+        source = ImageTk.getimage(self._bg_image).convert("RGB")
+        if source.size != (canvas_width, canvas_height):
+            resampling = getattr(Image, "Resampling", Image).LANCZOS
+            source = source.resize((canvas_width, canvas_height), resampling)
+        x = self.info.winfo_rootx() - self.canvas.winfo_rootx()
+        y = self.info.winfo_rooty() - self.canvas.winfo_rooty()
+        crop = source.crop((x, y, x + width, y + height))
+        tint = Image.new("RGB", crop.size, PANEL_TINT)
+        tinted = Image.blend(crop, tint, PANEL_TINT_STRENGTH)
+        photo = ImageTk.PhotoImage(tinted)
+        self._panel_backdrop.delete("all")
+        self._panel_backdrop.create_image(0, 0, anchor="nw", image=photo)
+        self._panel_backdrop_image = photo
 
     def _load_poster(self, poster: tk.Canvas) -> None:
         if self._poster_job is not None:
@@ -1106,19 +1175,19 @@ class DetailsView(tk.Frame):
 
     def _on_resize(self, event=None) -> None:
         if self._resize_job is not None:
-            return
+            self.after_cancel(self._resize_job)
         self._resize_job = self.after(200, self._check_resize)
 
     def _check_resize(self) -> None:
         self._resize_job = None
         if not self.winfo_exists() or self._item is None:
             return
+        self._refresh_panel_backdrop()
         width = self.canvas.winfo_width()
         height = self.canvas.winfo_height()
         if width < 2 or height < 2:
             return
-        # only a new bucket needs a new image
-        if bucket_size(width, height) != bucket_size(*self._last_geo):
+        if (width, height) != self._last_geo:
             self._load_backdrop()
 
     def _back(self) -> None:

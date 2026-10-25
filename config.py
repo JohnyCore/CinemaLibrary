@@ -9,6 +9,7 @@ log = logging.getLogger(__name__)
 APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"
 THUMB_CACHE_DIR = DATA_DIR / "thumbs"
+PEOPLE_CACHE_DIR = DATA_DIR / "people"
 LOG_DIR = DATA_DIR / "logs"
 DB_PATH = DATA_DIR / "library.db"
 PLACEHOLDER_PATH = APP_DIR / "assets" / "placeholder.png"
@@ -83,7 +84,7 @@ def save_settings(settings: dict) -> bool:
 
 def init() -> None:
     global MOVIES_DIR, SERIES_DIR, ORGANIZER_DIR
-    for d in (DATA_DIR, THUMB_CACHE_DIR, LOG_DIR):
+    for d in (DATA_DIR, THUMB_CACHE_DIR, PEOPLE_CACHE_DIR, LOG_DIR):
         try:
             d.mkdir(parents=True, exist_ok=True)
         except OSError:

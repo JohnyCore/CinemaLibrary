@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import logging
 import tkinter as tk
+import webbrowser
 from tkinter import font as tkfont
 from tkinter import ttk
 from typing import Callable
+
+from PIL import Image, ImageTk
 
 from utils.image_cache import ImageCache, ImageJob
 
@@ -28,6 +32,8 @@ TEXT_WIDTH = CARD_W - 12
 # every card is 5 canvas primitives: card rect, poster image, title text,
 # meta text, watched badge
 PRIMS_PER_CARD = 5
+
+log = logging.getLogger(__name__)
 
 
 class LibraryView(tk.Frame):
@@ -72,10 +78,68 @@ class LibraryView(tk.Frame):
         self._meta_font = tkfont.Font(family="Segoe UI", size=8)
         self._fit_cache: dict[str, str] = {}
 
-        self.canvas = tk.Canvas(
-            self, bg=BG, highlightthickness=0, yscrollincrement=1, takefocus=True
+        self._profile_panel = tk.Frame(
+            self, bg="#12161d", width=360, highlightthickness=1,
+            highlightbackground=BORDER,
         )
-        self.vsb = ttk.Scrollbar(self, orient="vertical", command=self._on_vsb,
+        self._profile_panel.pack_propagate(False)
+        profile_content = tk.Frame(self._profile_panel, bg="#12161d", padx=16, pady=16)
+        profile_content.pack(fill="both", expand=True)
+        self._profile_name = tk.Label(
+            profile_content, bg="#12161d", fg=TEXT,
+            font=("Segoe UI Semibold", 15), justify="left", anchor="w",
+            wraplength=310,
+        )
+        self._profile_name.pack(fill="x", pady=(0, 4))
+        self._profile_roles = tk.Label(
+            profile_content, bg="#12161d", fg=MUTED,
+            font=("Segoe UI", 9), anchor="w",
+        )
+        self._profile_roles.pack(fill="x", pady=(0, 10))
+        self._profile_photo = tk.Label(profile_content, bg="#12161d")
+        self._profile_photo.pack(anchor="w", pady=(0, 10))
+        profile_text_frame = tk.Frame(profile_content, bg="#12161d")
+        profile_text_frame.pack(fill="both", expand=True)
+        self._profile_text = tk.Text(
+            profile_text_frame, bg="#12161d", fg=TEXT, font=("Segoe UI", 10),
+            wrap="word", relief="flat", height=12, width=38,
+            padx=0, pady=0, highlightthickness=0,
+        )
+        profile_text_scroll = ttk.Scrollbar(
+            profile_text_frame, orient="vertical", command=self._profile_text.yview,
+            style="Dark.Vertical.TScrollbar",
+        )
+        self._profile_text.configure(yscrollcommand=profile_text_scroll.set)
+        self._profile_text.pack(side="left", fill="both", expand=True)
+        profile_text_scroll.pack(side="right", fill="y")
+        self._profile_status = tk.Label(
+            profile_content, bg="#12161d", fg=MUTED, font=("Segoe UI", 9),
+            justify="left", anchor="w", wraplength=320,
+        )
+        self._profile_status.pack(fill="x", pady=(8, 0))
+        profile_actions = tk.Frame(profile_content, bg="#12161d")
+        profile_actions.pack(fill="x", pady=(12, 0))
+        self._profile_wiki = tk.Button(
+            profile_actions, text="Open Wikipedia", command=self._open_profile_wiki,
+            bg="#1a2130", fg=TEXT, activebackground="#243046",
+            activeforeground=TEXT, bd=0, padx=10, pady=6, cursor="hand2",
+        )
+        self._profile_wiki.pack(side="left")
+        tk.Button(
+            profile_actions, text="Close", command=self.hide_person_profile,
+            bg="#1a2130", fg=TEXT, activebackground="#243046",
+            activeforeground=TEXT, bd=0, padx=10, pady=6, cursor="hand2",
+        ).pack(side="right")
+        self._profile_url: str | None = None
+        self._profile_image = None
+
+        self._main_area = tk.Frame(self, bg=BG)
+        self._main_area.pack(side="left", fill="both", expand=True)
+        self.canvas = tk.Canvas(
+            self._main_area, bg=BG, highlightthickness=0,
+            yscrollincrement=1, takefocus=True,
+        )
+        self.vsb = ttk.Scrollbar(self._main_area, orient="vertical", command=self._on_vsb,
                                  style="Dark.Vertical.TScrollbar")
         self.canvas.configure(yscrollcommand=self.vsb.set)
         self.vsb.pack(side="right", fill="y")
@@ -92,7 +156,7 @@ class LibraryView(tk.Frame):
         self.bind("<Destroy>", self._unbind_wheel)
 
         # the empty state sits over the canvas: a message and a button
-        self._empty_frame = tk.Frame(self, bg=BG)
+        self._empty_frame = tk.Frame(self._main_area, bg=BG)
         self._empty_label = tk.Label(self._empty_frame, text="", bg=BG, fg=MUTED,
                                      font=("Segoe UI", 12), justify="center")
         self._empty_label.pack(pady=(0, 12))
@@ -137,6 +201,72 @@ class LibraryView(tk.Frame):
 
     def focus_item(self, index: int) -> None:
         self._set_focus(index)
+
+    def show_person_profile(
+        self,
+        name: str,
+        role: str,
+        profile: dict | None = None,
+        status: str = "",
+    ) -> None:
+        """Show a cached or loading person profile beside the library grid."""
+        self._profile_name.configure(text=name)
+        self._profile_roles.configure(text=role.capitalize())
+        self._profile_status.configure(text=status)
+        self._profile_image = None
+        self._profile_photo.configure(image="", width=0, height=0)
+        self._profile_text.configure(state="normal")
+        self._profile_text.delete("1.0", "end")
+        self._profile_url = None
+        self._profile_wiki.configure(state="disabled")
+
+        if profile is not None:
+            self._profile_url = profile.get("url")
+            if self._profile_url:
+                self._profile_wiki.configure(state="normal")
+            if profile.get("not_found"):
+                self._profile_text.insert(
+                    "1.0", "No matching Wikipedia biography was found.")
+                self._profile_status.configure(
+                    text="This result is cached. The library can still be filtered by this name.")
+            else:
+                self._profile_text.insert("1.0", profile.get("extract") or "")
+                title = profile.get("name") or name
+                self._profile_status.configure(text=f"Wikipedia · {title}")
+                image_path = profile.get("image_path")
+                if image_path:
+                    try:
+                        with Image.open(image_path) as source:
+                            image = source.convert("RGB")
+                        image.thumbnail((320, 240),
+                                        getattr(Image, "Resampling", Image).LANCZOS)
+                        self._profile_image = ImageTk.PhotoImage(image)
+                        self._profile_photo.configure(
+                            image=self._profile_image,
+                            width=self._profile_image.width(),
+                            height=self._profile_image.height(),
+                        )
+                    except (OSError, ValueError) as exc:
+                        self._profile_status.configure(
+                            text=f"Biography is cached; photo unavailable: {exc}")
+        elif not status:
+            self._profile_text.insert("1.0", "No biography is available.")
+        self._profile_text.configure(state="disabled")
+        if not self._profile_panel.winfo_ismapped():
+            self._profile_panel.pack(
+                side="right", fill="y", before=self._main_area,
+            )
+
+    def hide_person_profile(self) -> None:
+        self._profile_panel.pack_forget()
+        self._profile_image = None
+
+    def _open_profile_wiki(self) -> None:
+        if self._profile_url:
+            try:
+                webbrowser.open(self._profile_url)
+            except Exception:
+                log.exception("could not open person profile in browser")
 
     # --- the selection -------------------------------------------------
 

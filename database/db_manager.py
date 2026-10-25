@@ -75,6 +75,15 @@ CREATE TABLE IF NOT EXISTS expected_episodes (
     name TEXT,
     PRIMARY KEY (series_id, season, episode)
 );
+CREATE TABLE IF NOT EXISTS person_profiles (
+    name_key TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    extract TEXT,
+    image_path TEXT,
+    url TEXT,
+    not_found INTEGER NOT NULL DEFAULT 0,
+    fetched_at REAL NOT NULL
+);
 """
 
 # created after the migration, so it can rely on the newer columns
@@ -582,6 +591,41 @@ class Database:
             "ORDER BY media_type, title"
         ).fetchall()
         return [dict(r) for r in rows]
+
+    def get_person_profile(self, name_key: str) -> dict | None:
+        """Return a cached people profile, if one has been fetched."""
+        row = self.conn.execute(
+            "SELECT name_key, name, extract, image_path, url, not_found, fetched_at "
+            "FROM person_profiles WHERE name_key=?",
+            (name_key,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def get_person_profiles(self) -> dict[str, dict]:
+        """Return cached people profiles indexed by normalized name."""
+        rows = self.conn.execute(
+            "SELECT name_key, name, extract, image_path, url, not_found, fetched_at "
+            "FROM person_profiles"
+        ).fetchall()
+        return {row["name_key"]: dict(row) for row in rows}
+
+    def save_person_profile(self, profile: dict) -> None:
+        """Persist a biography and its local image path for offline reading."""
+        with self.conn:
+            self.conn.execute(
+                "INSERT INTO person_profiles "
+                "(name_key, name, extract, image_path, url, not_found, fetched_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(name_key) DO UPDATE SET "
+                "name=excluded.name, extract=excluded.extract, "
+                "image_path=excluded.image_path, url=excluded.url, "
+                "not_found=excluded.not_found, fetched_at=excluded.fetched_at",
+                (
+                    profile["name_key"], profile["name"], profile.get("extract"),
+                    profile.get("image_path"), profile.get("url"),
+                    int(bool(profile.get("not_found"))), time.time(),
+                ),
+            )
 
     def duplicates(self) -> list[dict]:
         """Return groups of items that share the same title (case-insensitive)."""

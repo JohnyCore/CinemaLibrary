@@ -157,8 +157,13 @@ class ImageCache:
         on_ready: Callable[[ImageTk.PhotoImage], None],
         *,
         priority: int = 5,
+        disk_cache: bool = True,
     ) -> ImageJob | None:
-        return self._request(source, size, "backdrop", on_ready, priority)
+        """Request a backdrop, optionally avoiding a disk entry per size."""
+        return self._request(
+            source, size, "backdrop", on_ready, priority,
+            disk_cache=disk_cache,
+        )
 
     def _request(
         self,
@@ -168,9 +173,12 @@ class ImageCache:
         on_ready: Callable[[ImageTk.PhotoImage], None],
         priority: int,
         contain: bool = False,
+        disk_cache: bool = True,
     ) -> ImageJob | None:
         width, height = size
         name, disk = self._key(source, width, height, mode, contain)
+        if not disk_cache:
+            disk = None
         store = self._thumbs if mode == "thumb" else self._backdrops
         if name is not None:
             cached = store.get(name)

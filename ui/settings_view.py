@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import json
 import threading
 import time
 import tkinter as tk
@@ -12,6 +13,7 @@ import config
 from database.db_manager import Database
 from metadata import metadata_service
 from metadata import true_story
+from metadata.person_profiles import fetch_person_profile, person_key
 from utils import media_ops
 from utils.image_cache import BACKDROP_SIZES, ImageCache
 from utils.image_utils import find_artwork
@@ -63,6 +65,9 @@ class SettingsView(tk.Frame):
         self._meta_items: list[dict] = []
         self._bulk_running = False
         self._bulk_cancel = threading.Event()
+        self._people_items: list[dict] = []
+        self._people_running = False
+        self._people_cancel = threading.Event()
         self._drag_select_anchor: str | None = None
 
         header = tk.Frame(self, bg=BG)
@@ -176,6 +181,8 @@ class SettingsView(tk.Frame):
         self.after_idle(self._place_tab_indicator)
         if key == "bulk":
             self._refresh_bulk_list()
+            if self._people_page.winfo_ismapped():
+                self._refresh_people_list()
         elif key == "meta":
             self._refresh_meta_list()
         elif key == "organizer":
@@ -433,7 +440,30 @@ class SettingsView(tk.Frame):
         inner = tk.Frame(parent, bg=PANEL_BG, padx=16, pady=16)
         inner.pack(fill="both", expand=True)
 
-        header = tk.Frame(inner, bg=PANEL_BG)
+        section_bar = tk.Frame(inner, bg=PANEL_BG)
+        section_bar.pack(fill="x", pady=(0, 12))
+        section_style = dict(
+            bg=BTN_BG, fg=TEXT, activebackground=BTN_ACTIVE,
+            activeforeground=TEXT, bd=0, padx=12, pady=6,
+            font=("Segoe UI", 9), cursor="hand2",
+        )
+        self._bulk_section_btn = tk.Button(
+            section_bar, text="Movies & Series",
+            command=lambda: self._select_bulk_page("media"), **section_style,
+        )
+        self._bulk_section_btn.pack(side="left", padx=(0, 8))
+        self._people_section_btn = tk.Button(
+            section_bar, text="People Profiles",
+            command=lambda: self._select_bulk_page("people"), **section_style,
+        )
+        self._people_section_btn.pack(side="left")
+
+        media_page = tk.Frame(inner, bg=PANEL_BG)
+        media_page.pack(fill="both", expand=True)
+        self._bulk_media_page = media_page
+        self._people_page = tk.Frame(inner, bg=PANEL_BG)
+
+        header = tk.Frame(media_page, bg=PANEL_BG)
         header.pack(fill="x", pady=(0, 12))
 
         tk.Label(header, text="Unfetched items", bg=PANEL_BG, fg=TEXT,
@@ -446,8 +476,9 @@ class SettingsView(tk.Frame):
             bg=BTN_BG, fg=TEXT, activebackground=BTN_ACTIVE, activeforeground=TEXT,
             bd=0, padx=12, pady=5, font=("Segoe UI", 9), cursor="hand2",
         )
-        tk.Button(header, text="Refresh", command=self._refresh_bulk_list, **btn_style).pack(
-            side="right", padx=(8, 0))
+        self._bulk_refresh_btn = tk.Button(
+            header, text="Refresh", command=self._refresh_bulk_list, **btn_style)
+        self._bulk_refresh_btn.pack(side="right", padx=(8, 0))
         self._cancel_btn = tk.Button(header, text="Stop", command=self._cancel_bulk,
                                      state="disabled", **btn_style, disabledforeground="#5a6472")
         self._cancel_btn.pack(side="right", padx=(8, 0))
@@ -467,11 +498,12 @@ class SettingsView(tk.Frame):
                                          style="Dark.Horizontal.TProgressbar")
 
         # Treeview for performant scrolling
-        vsb = ttk.Scrollbar(inner, orient="vertical",
+        vsb = ttk.Scrollbar(media_page, orient="vertical",
                              command=lambda *a: self._bulk_tree.yview(*a),
                              style="Dark.Vertical.TScrollbar")
         vsb.pack(side="right", fill="y")
-        wrap = tk.Frame(inner, bg=PANEL_BG, highlightthickness=1, highlightbackground=BORDER)
+        wrap = tk.Frame(media_page, bg=PANEL_BG,
+                        highlightthickness=1, highlightbackground=BORDER)
         wrap.pack(side="left", fill="both", expand=True)
         columns = ("title", "type", "missing", "status")
         self._bulk_tree = ttk.Treeview(wrap, columns=columns, show="headings",
@@ -494,8 +526,251 @@ class SettingsView(tk.Frame):
         self._bulk_tree.bind("<Button-1>", self._on_tree_drag_start, add="+")
         self._bulk_tree.bind("<B1-Motion>", self._on_tree_drag_select, add="+")
 
+        self._build_people_fetch(self._people_page)
+        self._select_bulk_page("media")
+
+    def _build_people_fetch(self, parent: tk.Frame) -> None:
+        header = tk.Frame(parent, bg=PANEL_BG)
+        header.pack(fill="x", pady=(0, 8))
+        tk.Label(header, text="People profiles", bg=PANEL_BG, fg=TEXT,
+                 font=("Segoe UI Semibold", 12)).pack(side="left")
+        self._people_status = tk.Label(
+            header, bg=PANEL_BG, fg=MUTED, font=("Segoe UI", 9),
+            anchor="w", justify="left",
+        )
+        self._people_status.pack(side="left", padx=(10, 0))
+        btn_style = dict(
+            bg=BTN_BG, fg=TEXT, activebackground=BTN_ACTIVE, activeforeground=TEXT,
+            bd=0, padx=12, pady=5, font=("Segoe UI", 9), cursor="hand2",
+            disabledforeground="#5a6472",
+        )
+        self._people_refresh_btn = tk.Button(
+            header, text="Refresh", command=self._refresh_people_list, **btn_style)
+        self._people_refresh_btn.pack(side="right", padx=(8, 0))
+        self._people_stop_btn = tk.Button(
+            header, text="Stop", command=self._cancel_people_fetch,
+            state="disabled", **btn_style,
+        )
+        self._people_stop_btn.pack(side="right", padx=(8, 0))
+        self._people_all_btn = tk.Button(
+            header, text="Fetch All", command=self._fetch_all_people,
+            state="disabled", **btn_style,
+        )
+        self._people_all_btn.pack(side="right", padx=(8, 0))
+        self._people_selected_btn = tk.Button(
+            header, text="Fetch Selected", command=self._fetch_selected_people,
+            state="disabled", **btn_style,
+        )
+        self._people_selected_btn.pack(side="right", padx=(8, 0))
+        self._people_progress = ttk.Progressbar(
+            header, mode="determinate", length=150,
+            style="Dark.Horizontal.TProgressbar",
+        )
+
+        tk.Label(
+            parent,
+            text="Profiles are optional. Wikipedia biographies and photos are saved locally "
+                 "for offline viewing.",
+            bg=PANEL_BG, fg=MUTED, font=("Segoe UI", 9),
+        ).pack(anchor="w", pady=(0, 10))
+        vsb = ttk.Scrollbar(parent, orient="vertical",
+                            command=lambda *a: self._people_tree.yview(*a),
+                            style="Dark.Vertical.TScrollbar")
+        vsb.pack(side="right", fill="y")
+        wrap = tk.Frame(parent, bg=PANEL_BG,
+                        highlightthickness=1, highlightbackground=BORDER)
+        wrap.pack(side="left", fill="both", expand=True)
+        columns = ("name", "roles", "status")
+        self._people_tree = ttk.Treeview(
+            wrap, columns=columns, show="headings", style="Settings.Treeview",
+            height=20, selectmode="extended",
+        )
+        for column, title in (("name", "Name"), ("roles", "Roles"),
+                              ("status", "Profile")):
+            self._people_tree.heading(column, text=title)
+        self._people_tree.column("name", width=260, stretch=True)
+        self._people_tree.column("roles", width=180, stretch=True)
+        self._people_tree.column("status", width=120, stretch=False)
+        self._people_tree.tag_configure("odd", background="#151a24")
+        self._people_tree.configure(yscrollcommand=vsb.set)
+        self._people_tree.pack(side="left", fill="both", expand=True)
+        self._people_tree.bind("<<TreeviewSelect>>", self._on_people_select)
+        self._people_tree.bind("<Button-1>", self._on_tree_drag_start, add="+")
+        self._people_tree.bind("<B1-Motion>", self._on_tree_drag_select, add="+")
+
+    def _select_bulk_page(self, page: str) -> None:
+        if page == "people":
+            self._bulk_media_page.pack_forget()
+            self._people_page.pack(fill="both", expand=True)
+            self._people_section_btn.configure(fg=TEXT)
+            self._bulk_section_btn.configure(fg=MUTED)
+            if not self._people_running:
+                self._refresh_people_list()
+        else:
+            self._people_page.pack_forget()
+            self._bulk_media_page.pack(fill="both", expand=True)
+            self._bulk_section_btn.configure(fg=TEXT)
+            self._people_section_btn.configure(fg=MUTED)
+            if not self._people_running:
+                self._refresh_bulk_list()
+
+    def _refresh_people_list(self) -> None:
+        """List unique people found in metadata already stored by the user."""
+        if self._people_running:
+            return
+        people: dict[str, dict] = {}
+        for item in self._db.get_all_items():
+            for role, field in (
+                ("cast", "cast_list"), ("director", "director"), ("writer", "writer"),
+            ):
+                value = item.get(field)
+                if isinstance(value, str):
+                    try:
+                        decoded = json.loads(value)
+                    except ValueError:
+                        decoded = value
+                    names = decoded if isinstance(decoded, list) else str(decoded).split(",")
+                elif isinstance(value, list):
+                    names = value
+                else:
+                    names = []
+                for raw_name in names:
+                    name = str(raw_name).strip()
+                    key = person_key(name)
+                    if not name or not key:
+                        continue
+                    person = people.setdefault(
+                        key, {"name": name, "roles": [], "role": role})
+                    if role not in person["roles"]:
+                        person["roles"].append(role)
+                    if role == "cast":
+                        person["role"] = "cast"
+
+        cached = self._db.get_person_profiles()
+        self._people_items = sorted(people.values(), key=lambda p: p["name"].casefold())
+        for iid in self._people_tree.get_children():
+            self._people_tree.delete(iid)
+        for index, person in enumerate(self._people_items):
+            profile = cached.get(person_key(person["name"]))
+            if profile is None:
+                status = "Not fetched"
+            elif profile.get("not_found"):
+                status = "Not found"
+            else:
+                status = "Cached"
+            person["cached"] = profile is not None
+            self._people_tree.insert(
+                "", "end", iid=person_key(person["name"]),
+                values=(person["name"], ", ".join(person["roles"]), status),
+                tags=("odd",) if index % 2 else (),
+            )
+        unfetched = sum(not person["cached"] for person in self._people_items)
+        self._people_status.configure(
+            text=f"{len(self._people_items)} people · {unfetched} to fetch")
+        self._people_all_btn.configure(
+            state="normal" if unfetched and not self._people_running
+            and not self._bulk_running else "disabled")
+        self._on_people_select()
+
+    def _on_people_select(self, _event=None) -> None:
+        selected = set(self._people_tree.selection())
+        fetchable = any(
+            person_key(person["name"]) in selected and not person["cached"]
+            for person in self._people_items
+        )
+        self._people_selected_btn.configure(
+            state="normal" if fetchable and not self._people_running
+            and not self._bulk_running else "disabled")
+
+    def _fetch_selected_people(self) -> None:
+        selected = set(self._people_tree.selection())
+        self._fetch_people([
+            person for person in self._people_items
+            if person_key(person["name"]) in selected and not person["cached"]
+        ])
+
+    def _fetch_all_people(self) -> None:
+        self._fetch_people([person for person in self._people_items if not person["cached"]])
+
+    def _cancel_people_fetch(self) -> None:
+        self._people_cancel.set()
+        self._people_status.configure(text="Stopping after the current lookup…")
+
+    def _fetch_people(self, people: list[dict]) -> None:
+        if self._people_running or self._bulk_running or not people:
+            return
+        self._people_running = True
+        self._people_cancel.clear()
+        self._people_refresh_btn.configure(state="disabled")
+        self._people_selected_btn.configure(state="disabled")
+        self._people_all_btn.configure(state="disabled")
+        self._people_stop_btn.configure(state="normal")
+        self._people_progress.configure(maximum=len(people), value=0)
+        self._people_progress.pack(side="right", padx=(10, 0))
+        self._people_status.configure(text=f"Fetching 0/{len(people)} people…")
+        for button in (self._fetch_selected_btn, self._fetch_all_btn, self._retry_btn):
+            button.configure(state="disabled")
+        self._bulk_refresh_btn.configure(state="disabled")
+
+        def worker() -> None:
+            done = 0
+            failures = 0
+            for person in people:
+                if self._people_cancel.is_set():
+                    break
+                name = person["name"]
+                try:
+                    profile = fetch_person_profile(
+                        name, person["role"], config.PEOPLE_CACHE_DIR)
+                    self._db.save_person_profile(profile)
+                    status = "Not found" if profile.get("not_found") else "Cached"
+                except Exception as exc:
+                    log.warning("people profile fetch failed for %s: %s", name, exc)
+                    failures += 1
+                    status = "Failed"
+                done += 1
+                self._post(lambda n=name, s=status, d=done, total=len(people):
+                           self._people_row_done(n, s, d, total))
+            cancelled = self._people_cancel.is_set()
+            self._post(lambda d=done, f=failures, t=len(people), c=cancelled:
+                       self._people_fetch_finished(d, f, t, c))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _people_row_done(self, name: str, status: str, done: int, total: int) -> None:
+        key = person_key(name)
+        try:
+            self._people_tree.set(key, "status", status)
+        except tk.TclError:
+            pass
+        self._people_progress.configure(value=done)
+        self._people_status.configure(text=f"Fetching {done}/{total} people…")
+
+    def _people_fetch_finished(
+        self, done: int, failures: int, total: int, cancelled: bool,
+    ) -> None:
+        self._people_running = False
+        self._people_stop_btn.configure(state="disabled")
+        self._people_progress.pack_forget()
+        self._refresh_people_list()
+        if cancelled:
+            message = f"Stopped after {done}/{total} people."
+        else:
+            message = f"Fetched {done - failures}/{total} people."
+            if failures:
+                message += f" {failures} failed; refresh and retry later."
+        self._people_status.configure(text=message)
+        self._update_bulk_buttons_state()
+        self._people_refresh_btn.configure(
+            state="disabled" if self._bulk_running else "normal")
+        self._bulk_refresh_btn.configure(
+            state="disabled" if self._people_running else "normal")
+
     def _refresh_bulk_list(self) -> None:
         """Reload the list of unfetched items from DB."""
+        if self._people_running:
+            self._bulk_status.configure(text="Wait for the people profile fetch to finish.")
+            return
         self._bulk_items = self._db.get_unfetched()
         self._bulk_done = set()
         self._bulk_row_status.clear()
@@ -553,7 +828,7 @@ class SettingsView(tk.Frame):
 
     def _on_bulk_select(self, event) -> None:
         """Handle selection change in bulk fetch tree."""
-        if self._bulk_running:
+        if self._bulk_running or self._people_running:
             return
         state = "normal" if self._bulk_tree.selection() else "disabled"
         self._fetch_selected_btn.configure(state=state)
@@ -621,6 +896,9 @@ class SettingsView(tk.Frame):
         """Fetch metadata for a list of items, with progress and a stop button."""
         if not items:
             return
+        if self._people_running:
+            self._bulk_status.configure(text="Wait for the people profile fetch to finish.")
+            return
         self._bulk_running = True
         self._bulk_cancel.clear()
         self._bulk_failures = []
@@ -629,6 +907,10 @@ class SettingsView(tk.Frame):
         self._fetch_selected_btn.configure(state="disabled")
         self._fetch_all_btn.configure(state="disabled")
         self._retry_btn.configure(state="disabled")
+        for button in (self._people_selected_btn, self._people_all_btn,
+                       self._people_refresh_btn):
+            button.configure(state="disabled")
+        self._bulk_refresh_btn.configure(state="disabled")
         self._cancel_btn.configure(state="normal")
         self._progress.configure(maximum=len(items), value=0)
         self._progress.pack(side="left", padx=(12, 0), pady=(2, 0))
@@ -738,6 +1020,8 @@ class SettingsView(tk.Frame):
         self._bulk_failed_ids = failed_ids
         self._cancel_btn.configure(state="disabled")
         self._progress.pack_forget()
+        self._bulk_refresh_btn.configure(state="normal")
+        self._people_refresh_btn.configure(state="normal")
         # one refresh for the whole run, not one per item
         if changed and self._on_changed:
             self._on_changed(changed)
@@ -753,14 +1037,20 @@ class SettingsView(tk.Frame):
             self._bulk_status.configure(
                 text=f"Fetch complete — {done - failed}/{total} succeeded.")
         self._update_bulk_buttons_state()
+        self._on_people_select()
+        self._people_all_btn.configure(
+            state="normal" if any(not p.get("cached") for p in self._people_items)
+            and not self._people_running else "disabled")
 
     def _update_bulk_buttons_state(self) -> None:
         """Update bulk fetch button states."""
+        enabled = not self._people_running and not self._bulk_running
         self._fetch_selected_btn.configure(
-            state="normal" if self._bulk_tree.selection() else "disabled")
-        self._fetch_all_btn.configure(state="normal" if self._remaining() else "disabled")
+            state="normal" if self._bulk_tree.selection() and enabled else "disabled")
+        self._fetch_all_btn.configure(
+            state="normal" if self._remaining() and enabled else "disabled")
         self._retry_btn.configure(
-            state="normal" if (self._bulk_failed_ids and not self._bulk_running)
+            state="normal" if (self._bulk_failed_ids and enabled)
             else "disabled")
 
     def _retry_failed_bulk(self) -> None:
@@ -2057,4 +2347,3 @@ class SettingsView(tk.Frame):
         item = self._db.get(int(selection[0]))
         if item is not None:
             self._on_open_item(item)
-
