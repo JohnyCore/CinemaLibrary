@@ -14,6 +14,7 @@ from typing import Callable
 import config
 from database.db_manager import Database
 from metadata.person_profiles import fetch_person_profile, person_key
+from scanner import scan_state
 from scanner.library_scanner import scan
 from ui.details_view import DetailsView
 from ui.dialogs import ConfirmDialog, PopupMenu, PromptDialog
@@ -932,6 +933,21 @@ class MainWindow(tk.Frame):
                 text="No media folder is set - choose one in Settings.")
             return
         configured = {str(d) for d in (movies_dir, series_dir) if d}
+        previous = scan_state.load_scan_state()
+        current = {}
+        for root in (movies_dir, series_dir):
+            if root is None:
+                continue
+            key = scan_state.root_key(root)
+            sig = scan_state.root_signature(root)
+            if sig is not None:
+                current[key] = sig
+        if previous and current and all(current.get(scan_state.root_key(root)) == previous.get(scan_state.root_key(root)) for root in (movies_dir, series_dir) if root is not None):
+            self._scan_running = False
+            self._rescan_btn.configure(state="normal", text="Rescan Library")
+            self._scan_progress.pack_forget()
+            self._status_left.configure(text="Library up to date - no changes detected.")
+            return
 
         def worker() -> None:
             def progress(done: int, total: int) -> None:
@@ -966,6 +982,14 @@ class MainWindow(tk.Frame):
                 self._scan_running = False
                 self._rescan_btn.configure(state="normal", text="Rescan Library")
                 self._scan_progress.pack_forget()
+                next_state = scan_state.load_scan_state()
+                for root in (movies_dir, series_dir):
+                    if root is None:
+                        continue
+                    sig = scan_state.root_signature(root)
+                    if sig is not None:
+                        next_state[scan_state.root_key(root)] = sig
+                scan_state.save_scan_state(next_state)
                 self._status_left.configure(
                     text=f"Scan finished in {seconds:.1f}s — "
                          f"{counts.get('movie', 0)} movies, "

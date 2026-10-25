@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import logging
+import threading
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
@@ -77,6 +79,8 @@ class MetadataService:
 
 
 _service: MetadataService | None = None
+_FETCH_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="metadata")
+_FETCH_CANCELS: dict[str, threading.Event] = {}
 
 
 def set_service(service: MetadataService) -> None:
@@ -98,6 +102,35 @@ def fetch_metadata(
     imdb_id: str | None = None,
 ) -> MetadataResult | None:
     return get_service().fetch_metadata(title, year, media_type, imdb_id)
+
+
+def fetch_metadata_async(
+    title: str, year: int | None = None, media_type: str | None = None,
+    imdb_id: str | None = None,
+) -> tuple[str, threading.Event]:
+    """Queue a metadata fetch on a dedicated worker pool and return a cancel token."""
+    token = uuid.uuid4().hex
+    cancel = threading.Event()
+    _FETCH_CANCELS[token] = cancel
+
+    def run() -> None:
+        try:
+            if cancel.is_set():
+                return
+            get_service().fetch_metadata(title, year, media_type, imdb_id)
+        finally:
+            _FETCH_CANCELS.pop(token, None)
+
+    _FETCH_POOL.submit(run)
+    return token, cancel
+
+
+def cancel_fetch(token: str) -> bool:
+    cancel = _FETCH_CANCELS.get(token)
+    if cancel is None:
+        return False
+    cancel.set()
+    return True
 
 
 def search_candidates(

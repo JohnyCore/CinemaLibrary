@@ -9,6 +9,7 @@ from typing import Callable
 import config
 from utils import title_parser as tp
 from utils.image_utils import find_artwork
+from utils.path_utils import canonical_path
 
 log = logging.getLogger(__name__)
 
@@ -84,17 +85,17 @@ def scan(
     for root, entries, listed in roots:
         root_str = str(root)
         if listed and walked is not None:
-            walked.add(root_str)
+            walked.add(canonical_path(root_str))
         for entry in entries:
             try:
                 item = _classify(entry, root_str, art_cache, unreadable)
             except OSError:
                 # the folder could not be read - its rows have to be kept
                 if unreadable is not None:
-                    unreadable.add(str(entry))
+                    unreadable.add(canonical_path(str(entry)))
                 item = None
             if item is not None:
-                key = item.path.lower()
+                key = canonical_path(item.path)
                 if key not in seen:
                     seen.add(key)
                     items.append(item)

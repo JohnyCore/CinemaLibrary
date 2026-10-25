@@ -9,6 +9,8 @@ import threading
 import time
 from pathlib import Path
 
+from utils.path_utils import canonical_path
+
 log = logging.getLogger(__name__)
 
 _SCHEMA = """
@@ -48,6 +50,8 @@ CREATE TABLE IF NOT EXISTS media (
 CREATE INDEX IF NOT EXISTS idx_media_type ON media(media_type);
 CREATE INDEX IF NOT EXISTS idx_media_title ON media(title COLLATE NOCASE);
 CREATE INDEX IF NOT EXISTS idx_media_root ON media(root);
+CREATE INDEX IF NOT EXISTS idx_media_path ON media(path);
+CREATE INDEX IF NOT EXISTS idx_episodes_path ON episodes(path);
 CREATE TABLE IF NOT EXISTS collections (
     id INTEGER PRIMARY KEY,
     name TEXT NOT NULL UNIQUE
@@ -1012,15 +1016,16 @@ class Database:
         now = time.time()
         # the items that were taken out of the library stay out
         ignored = self.ignored_paths()
+        ignored_norm = {canonical_path(p) for p in ignored}
         if ignored:
-            items = [i for i in items if i.path not in ignored]
-        new_paths = {i.path for i in items}
+            items = [i for i in items if canonical_path(i.path) not in ignored_norm]
+        new_paths = {canonical_path(i.path) for i in items}
         if scanned_roots is None:
-            scanned_roots = {i.root for i in items}
+            scanned_roots = {canonical_path(i.root) for i in items}
         conn = self.conn
         with conn:
             existing = {
-                r["path"]: dict(r) for r in conn.execute(_SELECT_EXISTING)
+                canonical_path(r["path"]): dict(r) for r in conn.execute(_SELECT_EXISTING)
             }
             # the episode rows are read before the stale media rows are
             # deleted - deleting a series cascades its episodes away
@@ -1034,18 +1039,19 @@ class Database:
             renamed = self._match_renames(items, existing)
 
             # the difference to the scan before - the status line shows it
-            added = sum(1 for i in items if i.path not in existing)
+            added = sum(1 for i in items if canonical_path(i.path) not in existing)
             changed = sum(1 for i in items
-                          if i.path in existing and self._changed(existing[i.path], i))
+                          if canonical_path(i.path) in existing
+                          and self._changed(existing[canonical_path(i.path)], i))
 
             stale = [
                 (row["id"],)
                 for row in existing.values()
-                if row["path"] not in new_paths
+                if canonical_path(row["path"]) not in new_paths
                 and not self._protected(row["path"], unreadable)
                 and (
-                    row["root"] in scanned_roots
-                    or (configured_roots is not None and row["root"] not in configured_roots)
+                    canonical_path(row["root"]) in scanned_roots
+                    or (configured_roots is not None and canonical_path(row["root"]) not in {canonical_path(r) for r in configured_roots})
                 )
             ]
             if stale:
@@ -1085,13 +1091,13 @@ class Database:
                 conn.executemany(_CARRY_MEDIA, carries)
 
             ids = {
-                row["path"]: row["id"]
+                canonical_path(row["path"]): row["id"]
                 for row in conn.execute("SELECT id, path FROM media WHERE media_type='series'")
             }
             for i in items:
                 if i.media_type != "series":
                     continue
-                sid = ids.get(i.path)
+                sid = ids.get(canonical_path(i.path))
                 if sid is None:
                     continue
                 old = renamed.get(i.path)
@@ -1128,9 +1134,12 @@ class Database:
         """
         if not folders:
             return False
+        target = canonical_path(path)
         for folder in folders:
-            base = folder.rstrip("\\/")
-            if path == base or path.startswith(base + os.sep):
+            base = canonical_path(folder).rstrip("\\/")
+            if not base:
+                continue
+            if target == base or target.startswith(base + os.sep):
                 return True
         return False
 
@@ -1148,19 +1157,19 @@ class Database:
             video_path = row["video_path"]
             if video_path:
                 by_video.setdefault(
-                    (row["root"], Path(video_path).name.lower()), row)
+                    (canonical_path(row["root"]), Path(video_path).name.lower()), row)
             by_title.setdefault(
-                (row["root"], str(row["title"] or "").strip().lower()), row)
+                (canonical_path(row["root"]), str(row["title"] or "").strip().lower()), row)
         out: dict = {}
         for i in items:
-            if i.path in existing:
+            if canonical_path(i.path) in existing:
                 continue
             row = None
             if i.video_path:
-                row = by_video.get((i.root, Path(i.video_path).name.lower()))
+                row = by_video.get((canonical_path(i.root), Path(i.video_path).name.lower()))
             if row is None:
                 row = by_title.get(
-                    (i.root, str(i.title or "").strip().lower()))
+                    (canonical_path(i.root), str(i.title or "").strip().lower()))
             if row is not None:
                 out[i.path] = row
         return out
@@ -1174,8 +1183,8 @@ class Database:
         """
         old = [dict(r) for r in conn.execute(_SELECT_EPISODES, (sid,))]
         old.extend(carry)
-        old_by_path = {r["path"]: r for r in old}
-        new_paths = {e.path for e in episodes}
+        old_by_path = {canonical_path(r["path"]): r for r in old}
+        new_paths = {canonical_path(e.path) for e in episodes}
 
         # an episode whose file was renamed keeps its watched flag
         by_number: dict[tuple, dict] = {}
@@ -1187,7 +1196,7 @@ class Database:
                 by_number.setdefault((r["season"], r["episode"]), r)
             by_name.setdefault(Path(r["path"]).name.lower(), r)
 
-        gone = [r["path"] for r in old if r["path"] not in new_paths]
+        gone = [r["path"] for r in old if canonical_path(r["path"]) not in new_paths]
         if gone:
             conn.executemany("DELETE FROM episodes WHERE path=?", [(p,) for p in gone])
         if not episodes:
@@ -1197,9 +1206,10 @@ class Database:
         # always writes the complete set, so they are replaced wholesale
         upserts, inserts = [], []
         for e in episodes:
+            key = canonical_path(e.path)
             watched, last_watched = 0, None
             released, summary, name_from_provider = None, None, 0
-            if e.path not in old_by_path:
+            if key not in old_by_path:
                 match = None
                 if e.season is not None and e.episode is not None:
                     match = by_number.get((e.season, e.episode))
@@ -1216,7 +1226,7 @@ class Database:
             elif e.episode is None:
                 # without the upsert merge the watched flag has to be
                 # carried over by hand
-                old_row = old_by_path[e.path]
+                old_row = old_by_path[key]
                 watched = old_row["watched"] or 0
                 last_watched = old_row["last_watched"]
             row = (
