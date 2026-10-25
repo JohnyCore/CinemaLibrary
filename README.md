@@ -1,5 +1,9 @@
 # Cinema — Personal Movie & TV Series Library
 
+<p>
+  <img width="1280" src="https://i.imgur.com/Oeae7ZO.jpeg" />
+</p>
+
 A dark, media-centre-style desktop app that scans your local folders and shows
 your movies and series in a poster grid, with detailed series/episode views.
 It runs fully offline; an optional metadata provider (Cinemeta) can be
