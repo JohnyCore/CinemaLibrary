@@ -1,7 +1,12 @@
 from __future__ import annotations
 
-import logging
+import csv
 import json
+import logging
+import os
+import sqlite3
+import subprocess
+import sys
 import threading
 import time
 import tkinter as tk
@@ -208,83 +213,240 @@ class SettingsView(tk.Frame):
             width=btn.winfo_width(), height=2,
         )
 
+    @staticmethod
+    def _page_intro(parent: tk.Frame, title: str, description: str) -> None:
+        """Give each settings tool a shared title and concise explanation."""
+        header = tk.Frame(parent, bg=PANEL_BG)
+        header.pack(fill="x", pady=(0, 14))
+        tk.Label(
+            header, text=title, bg=PANEL_BG, fg=TEXT,
+            font=("Segoe UI Semibold", 17),
+        ).pack(anchor="w")
+        tk.Label(
+            header, text=description, bg=PANEL_BG, fg=MUTED,
+            font=("Segoe UI", 9), justify="left",
+        ).pack(anchor="w", pady=(3, 0))
+
     # --- General tab --------------------------------------------------
 
     def _build_general(self, parent: tk.Frame) -> None:
-        inner = tk.Frame(parent, bg=PANEL_BG, padx=22, pady=20)
-        inner.pack(fill="both", expand=True)
+        viewport = tk.Frame(parent, bg=PANEL_BG)
+        viewport.pack(fill="both", expand=True)
+        canvas = tk.Canvas(viewport, bg=PANEL_BG, highlightthickness=0, bd=0)
+        scrollbar = ttk.Scrollbar(
+            viewport, orient="vertical", command=canvas.yview,
+            style="Dark.Vertical.TScrollbar",
+        )
+        canvas.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        self._general_canvas = canvas
 
-        tk.Label(inner, text="Media folders", bg=PANEL_BG, fg=TEXT,
-                 font=("Segoe UI Semibold", 12)).pack(anchor="w")
+        inner = tk.Frame(canvas, bg=PANEL_BG, padx=22, pady=20)
+        window = canvas.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind(
+            "<Configure>",
+            lambda _event: canvas.configure(scrollregion=canvas.bbox("all")),
+        )
+        canvas.bind(
+            "<Configure>",
+            lambda event: canvas.itemconfigure(window, width=event.width),
+        )
+
+        def card(parent_frame: tk.Frame, title: str, description: str) -> tk.Frame:
+            box = tk.Frame(
+                parent_frame, bg="#0f1319", highlightthickness=1,
+                highlightbackground=BORDER, padx=18, pady=15,
+            )
+            box.pack(fill="x", pady=(0, 12))
+            tk.Label(
+                box, text=title, bg="#0f1319", fg=TEXT,
+                font=("Segoe UI Semibold", 11),
+            ).pack(anchor="w")
+            tk.Label(
+                box, text=description, bg="#0f1319", fg=MUTED,
+                font=("Segoe UI", 9), justify="left",
+            ).pack(anchor="w", pady=(3, 12))
+            return box
+
+        button_style = {
+            "bg": BTN_BG, "fg": TEXT, "activebackground": BTN_ACTIVE,
+            "activeforeground": TEXT, "bd": 0, "padx": 14, "pady": 8,
+            "font": ("Segoe UI", 9, "bold"), "cursor": "hand2",
+        }
+
+        intro = tk.Frame(inner, bg=PANEL_BG)
+        intro.pack(fill="x", pady=(0, 14))
         tk.Label(
-            inner,
-            text="Point Cinema at your existing collection.\n"
-                 "Changes take effect after a rescan.",
-            bg=PANEL_BG, fg=MUTED, font=("Segoe UI", 9), justify="left",
-        ).pack(anchor="w", pady=(2, 14))
+            intro, text="General preferences", bg=PANEL_BG, fg=TEXT,
+            font=("Segoe UI Semibold", 17),
+        ).pack(anchor="w")
+        tk.Label(
+            intro, text="Manage where your library lives and how Cinema works with it.",
+            bg=PANEL_BG, fg=MUTED, font=("Segoe UI", 9),
+        ).pack(anchor="w", pady=(3, 0))
 
         current = config.load_settings()
         self._movies_var = tk.StringVar(value=str(current.get("movies_dir", "")))
         self._series_var = tk.StringVar(value=str(current.get("series_dir", "")))
         self._organizer_var = tk.StringVar(value=str(current.get("organizer_dir", "")))
-        self._folder_row(inner, "Movies folder", self._movies_var)
-        self._folder_row(inner, "TV Series folder", self._series_var)
-        self._folder_row(inner, "Organizer folder", self._organizer_var)
 
-        btns = tk.Frame(inner, bg=PANEL_BG)
-        btns.pack(anchor="w", pady=(12, 0))
-        btn_style = dict(
-            bg=BTN_BG, fg=TEXT, activebackground=BTN_ACTIVE, activeforeground=TEXT,
-            bd=0, padx=16, pady=7, font=("Segoe UI", 10), cursor="hand2",
+        primary_row = tk.Frame(inner, bg=PANEL_BG)
+        primary_row.pack(fill="x")
+        folders = card(
+            primary_row, "Library locations",
+            "Choose the folders Cinema scans. Changes take effect after saving and rescanning.",
         )
-        tk.Button(btns, text="Save", command=self._save, **btn_style).pack(
-            side="left", padx=(0, 10)
+        folders.pack_configure(
+            side="left", fill="both", expand=True, padx=(0, 6), pady=(0, 12),
         )
-        tk.Button(btns, text="Clear Thumbnail Cache", command=self._clear_cache,
-                  **btn_style).pack(side="left", padx=(0, 10))
-        tk.Button(btns, text="Prune Stale Thumbnails", command=self._prune_cache,
-                  **btn_style).pack(side="left")
-
-        self._status = tk.Label(inner, bg=PANEL_BG, fg=MUTED, font=("Segoe UI", 9),
-                                anchor="w", justify="left")
-        self._status.pack(anchor="w", pady=(12, 0))
-        self._cache_info = tk.Label(inner, bg=PANEL_BG, fg=MUTED, font=("Segoe UI", 9),
-                                    anchor="w", justify="left")
-        self._cache_info.pack(anchor="w")
-        self._show_cache_info()
-
-        tk.Frame(inner, bg=BORDER, height=1).pack(fill="x", pady=(18, 14))
-        tk.Label(inner, text="Video player", bg=PANEL_BG, fg=TEXT,
-                 font=("Segoe UI Semibold", 12)).pack(anchor="w")
+        self._folder_row(folders, "Movies", self._movies_var)
+        self._folder_row(folders, "TV series", self._series_var)
+        self._folder_row(folders, "Organizer destination", self._organizer_var)
+        save_row = tk.Frame(folders, bg="#0f1319")
+        save_row.pack(fill="x", pady=(2, 0))
         tk.Label(
-            inner,
-            text="Videos are opened with the player you choose here.\n"
-                 "Add the program of any player you have installed.",
-            bg=PANEL_BG, fg=MUTED, font=("Segoe UI", 9), justify="left",
-        ).pack(anchor="w", pady=(2, 8))
-        player_row = tk.Frame(inner, bg=PANEL_BG)
-        player_row.pack(anchor="w")
+            save_row, text="Saved locally in settings.json.",
+            bg="#0f1319", fg=MUTED, font=("Segoe UI", 8),
+        ).pack(anchor="w", pady=(0, 8))
+        tk.Button(
+            save_row, text="Save locations", command=self._save,
+            bg=ACCENT, fg="#ffffff", activebackground="#f05a60",
+            activeforeground="#ffffff", bd=0, padx=16, pady=8,
+            font=("Segoe UI", 9, "bold"), cursor="hand2",
+        ).pack(anchor="w")
+
+        player_card = card(
+            primary_row, "Video player", "Choose how videos open when you play them.",
+        )
+        player_card.pack_configure(
+            side="left", fill="both", expand=True, padx=(6, 0), pady=(0, 12),
+        )
+        player_row = tk.Frame(player_card, bg="#0f1319")
+        player_row.pack(fill="x", pady=(4, 0))
         self._player_combo = ttk.Combobox(
-            player_row, state="readonly", width=36, style="Dark.TCombobox")
-        self._player_combo.pack(side="left")
+            player_row, state="readonly", width=26, style="Dark.TCombobox",
+        )
+        self._player_combo.pack(fill="x", pady=(0, 10))
         self._player_combo.bind("<<ComboboxSelected>>", self._on_player)
-        tk.Button(player_row, text="Add player…", command=self._add_player,
-                  **btn_style).pack(side="left", padx=(10, 0))
-        tk.Button(player_row, text="Remove", command=self._remove_player,
-                  **btn_style).pack(side="left", padx=(8, 0))
+        player_actions = tk.Frame(player_row, bg="#0f1319")
+        player_actions.pack(fill="x")
+        tk.Button(player_actions, text="Add player…", command=self._add_player,
+                  **button_style).pack(side="left")
+        tk.Button(player_actions, text="Remove", command=self._remove_player,
+                  **button_style).pack(side="left", padx=(8, 0))
         self._refresh_players()
 
-        tk.Frame(inner, bg=BORDER, height=1).pack(fill="x", pady=(18, 14))
-        tk.Label(inner, text="Metadata provider", bg=PANEL_BG, fg=TEXT,
-                 font=("Segoe UI Semibold", 12)).pack(anchor="w")
+        storage = card(
+            inner, "Backup & export",
+            "Keep a portable backup, move your library, or export a spreadsheet-friendly list.",
+        )
+        actions = tk.Frame(storage, bg="#0f1319")
+        actions.pack(fill="x")
+        for column in range(2):
+            actions.grid_columnconfigure(column, weight=1, uniform="general-action")
+
+        def action(column: int, row: int, title: str, detail: str,
+                   button_text: str, command, accent: str) -> None:
+            tile = tk.Frame(
+                actions, bg="#151a24", highlightthickness=1,
+                highlightbackground=BORDER, padx=12, pady=10,
+            )
+            tile.grid(
+                row=row, column=column, sticky="nsew",
+                padx=(0 if column == 0 else 6, 6 if column == 0 else 0),
+                pady=(0, 8),
+            )
+            tk.Label(
+                tile, text=title, bg="#151a24", fg=TEXT,
+                font=("Segoe UI Semibold", 9),
+            ).pack(anchor="w")
+            tk.Label(
+                tile, text=detail, bg="#151a24", fg=MUTED,
+                font=("Segoe UI", 8), justify="left", wraplength=300,
+            ).pack(anchor="w", pady=(3, 8))
+            action_style = {
+                **button_style, "bg": accent, "activebackground": accent,
+                "activeforeground": "#ffffff",
+            }
+            tk.Button(
+                tile, text=button_text, command=command, **action_style,
+            ).pack(anchor="w")
+
+        action(0, 0, "Portable backup", "Database, settings, and artwork caches in one ZIP.",
+               "Export backup", self._export_backup, "#344466")
+        action(1, 0, "Restore your library", "Validate a ZIP before restoring your library.",
+               "Choose backup…", self._restore_backup, "#344466")
+        action(0, 1, "Spreadsheet export", "Save your movie and series list as a CSV file.",
+               "Export CSV", self._export_csv, BTN_BG)
+        action(1, 1, "Local data folder", "Open Cinema's local database and cache folder.",
+               "Open folder", self._open_data_folder, BTN_BG)
+        self._status = tk.Label(
+            storage, bg="#0f1319", fg=MUTED, font=("Segoe UI", 9),
+            anchor="w", justify="left", wraplength=760,
+        )
+        self._status.pack(fill="x", pady=(4, 0))
+
+        cache = card(
+            inner, "Artwork cache",
+            "Cached artwork makes browsing faster. It can be rebuilt automatically when needed.",
+        )
+        cache_row = tk.Frame(cache, bg="#0f1319")
+        cache_row.pack(fill="x")
+        self._cache_info = tk.Label(
+            cache_row, bg="#0f1319", fg=TEXT, font=("Segoe UI", 9, "bold"),
+            anchor="w",
+        )
+        self._cache_info.pack(side="left", fill="x", expand=True)
+        tk.Button(
+            cache_row, text="Clear cache", command=self._clear_cache,
+            **button_style,
+        ).pack(side="right", padx=(8, 0))
+        tk.Button(
+            cache_row, text="Prune stale", command=self._prune_cache,
+            **button_style,
+        ).pack(side="right")
+        self._show_cache_info()
+
+        provider_card = card(
+            inner, "Metadata provider",
+            "Metadata lookups are provided by the service configured for this app.",
+        )
         provider = self._provider_name()
         tk.Label(
-            inner,
-            text=f"Connected provider: {provider}\n"
-                 "API keys, when a provider needs one, belong in settings.json "
-                 "(never in source code).",
-            bg=PANEL_BG, fg=MUTED, font=("Segoe UI", 9), justify="left",
-        ).pack(anchor="w", pady=(2, 0))
+            provider_card, text=provider, bg="#0f1319", fg="#9bb8ff",
+            font=("Segoe UI Semibold", 10), wraplength=760, justify="left",
+        ).pack(anchor="w")
+        tk.Label(
+            provider_card,
+            text="Settings and provider keys are kept on this device.",
+            bg="#0f1319", fg=MUTED, font=("Segoe UI", 8),
+        ).pack(anchor="w", pady=(6, 0))
+
+        def bind_mousewheel(widget: tk.Widget) -> None:
+            widget.bind("<MouseWheel>", self._on_general_mousewheel, add="+")
+            widget.bind("<Button-4>", self._on_general_mousewheel, add="+")
+            widget.bind("<Button-5>", self._on_general_mousewheel, add="+")
+            for child in widget.winfo_children():
+                bind_mousewheel(child)
+
+        bind_mousewheel(canvas)
+        bind_mousewheel(inner)
+
+    def _on_general_mousewheel(self, event) -> str:
+        """Scroll the General tab wherever the pointer is over its content."""
+        if getattr(event, "num", None) == 4:
+            units = -1
+        elif getattr(event, "num", None) == 5:
+            units = 1
+        else:
+            delta = int(getattr(event, "delta", 0))
+            units = -int(delta / 120)
+            if not units and delta:
+                units = -1 if delta > 0 else 1
+        if units:
+            self._general_canvas.yview_scroll(units, "units")
+        return "break"
 
     # --- the video player ---------------------------------------------
 
@@ -354,16 +516,17 @@ class SettingsView(tk.Frame):
         return getattr(service, "provider", None) or type(service).__name__
 
     def _folder_row(self, parent, label: str, var: tk.StringVar) -> None:
-        tk.Label(parent, text=label, bg=PANEL_BG, fg=MUTED,
+        bg = parent.cget("bg")
+        tk.Label(parent, text=label, bg=bg, fg=MUTED,
                  font=("Segoe UI", 9)).pack(anchor="w")
-        row = tk.Frame(parent, bg=PANEL_BG)
-        row.pack(anchor="w", pady=(2, 12))
+        row = tk.Frame(parent, bg=bg)
+        row.pack(fill="x", pady=(3, 10))
         entry = tk.Entry(
             row, textvariable=var, bg=FIELD_BG, fg=TEXT, insertbackground=TEXT,
             bd=0, highlightthickness=1, highlightbackground=BORDER,
-            font=("Segoe UI", 10), width=52,
+            font=("Segoe UI", 10),
         )
-        entry.pack(side="left", ipady=5)
+        entry.pack(side="left", fill="x", expand=True, ipady=6)
         tk.Button(
             row, text="Browse…", command=lambda: self._browse(var),
             bg=BTN_BG, fg=TEXT, activebackground=BTN_ACTIVE, activeforeground=TEXT,
@@ -403,6 +566,131 @@ class SettingsView(tk.Frame):
         if self._on_saved is not None:
             self._on_saved()
 
+    def _export_backup(self) -> None:
+        """Export a zip backup containing the library database and settings."""
+        default_name = f"cinema-backup-{time.strftime('%Y%m%d-%H%M%S')}.zip"
+        path = filedialog.asksaveasfilename(
+            parent=self,
+            title="Export Cinema backup",
+            defaultextension=".zip",
+            initialfile=default_name,
+            filetypes=[("ZIP archive", "*.zip"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        ok, message = config.backup_library(path)
+        self._status.configure(text=message, fg="#b5f1cd" if ok else ACCENT)
+        self.after(3000, lambda: self._status.configure(fg=MUTED))
+
+    def _restore_backup(self) -> None:
+        """Restore a library backup with a confirmation step."""
+        path = filedialog.askopenfilename(
+            parent=self,
+            title="Restore Cinema backup",
+            filetypes=[("ZIP archive", "*.zip"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        valid, validation_message = config.validate_library_backup(path)
+        if not valid:
+            self._status.configure(text=validation_message, fg=ACCENT)
+            self.after(3000, lambda: self._status.configure(fg=MUTED))
+            return
+        confirm = ConfirmDialog(
+            self,
+            "Restore backup",
+            "This will replace your current database and settings with the selected backup. "
+            "A safety copy of the current database and settings will be kept before the restore.",
+            confirm_text="Restore backup",
+        )
+        if not confirm.ask():
+            return
+        ok, message = config.restore_library_backup(path)
+        self._status.configure(text=message)
+        if ok:
+            self._status.configure(fg="#b5f1cd")
+            settings = config.load_settings()
+            self._movies_var.set(settings.get("movies_dir", ""))
+            self._series_var.set(settings.get("series_dir", ""))
+            self._organizer_var.set(settings.get("organizer_dir", ""))
+            self._refresh_players()
+            self._on_saved()
+            self.after(2000, lambda: self._status.configure(fg=MUTED))
+        else:
+            self._status.configure(fg=ACCENT)
+            self.after(3000, lambda: self._status.configure(fg=MUTED))
+
+    def _open_data_folder(self) -> None:
+        """Open the local data folder in file explorer."""
+        target = config.DATA_DIR
+        try:
+            target.mkdir(parents=True, exist_ok=True)
+            if os.name == "nt":
+                subprocess.Popen(["explorer", str(target)])
+            else:
+                command = ["open", str(target)] if sys.platform == "darwin" else [
+                    "xdg-open", str(target)
+                ]
+                subprocess.Popen(command)
+            self._status.configure(text=f"Opened data folder: {target}", fg="#b5f1cd")
+        except OSError as exc:
+            log.exception("could not open data folder %s", target)
+            self._status.configure(text=f"Could not open the data folder: {exc}", fg=ACCENT)
+        self.after(3000, lambda: self._status.configure(fg=MUTED))
+
+    def _export_csv(self) -> None:
+        """Export the current library as a CSV list."""
+        default_name = f"cinema-library-{time.strftime('%Y%m%d-%H%M%S')}.csv"
+        path = filedialog.asksaveasfilename(
+            parent=self,
+            title="Export library CSV",
+            defaultextension=".csv",
+            initialfile=default_name,
+            filetypes=[("CSV file", "*.csv"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            rows = [
+                row for row in self._db.load_all()
+                if row.get("media_type") in ("movie", "series")
+            ]
+            with open(path, "w", newline="", encoding="utf-8-sig") as handle:
+                writer = csv.DictWriter(
+                    handle,
+                    fieldnames=[
+                        "id", "title", "media_type", "year", "runtime",
+                        "rating", "my_rating", "watched", "genres", "director",
+                        "writer", "cast_list", "country", "path",
+                    ],
+                )
+                writer.writeheader()
+                for row in rows:
+                    writer.writerow({
+                        "id": row.get("id"),
+                        "title": row.get("title") or "",
+                        "media_type": row.get("media_type") or "",
+                        "year": row.get("year", ""),
+                        "runtime": row.get("runtime", ""),
+                        "rating": row.get("rating", ""),
+                        "my_rating": row.get("my_rating", ""),
+                        "watched": row.get("watched", 0),
+                        "genres": row.get("genres") or "",
+                        "director": row.get("director") or "",
+                        "writer": row.get("writer") or "",
+                        "cast_list": row.get("cast_list") or "",
+                        "country": row.get("country") or "",
+                        "path": row.get("path") or "",
+                    })
+        except (OSError, csv.Error, sqlite3.Error) as exc:
+            self._status.configure(text=f"CSV export failed: {exc}", fg=ACCENT)
+            self.after(3000, lambda: self._status.configure(fg=MUTED))
+            return
+        self._status.configure(
+            text=f"Exported {len(rows)} movies and series to {path}", fg="#b5f1cd"
+        )
+        self.after(3000, lambda: self._status.configure(fg=MUTED))
+
     def _show_cache_info(self) -> None:
         """Show how big the thumbnail cache is."""
         count = 0
@@ -439,6 +727,10 @@ class SettingsView(tk.Frame):
     def _build_bulk_fetch(self, parent: tk.Frame) -> None:
         inner = tk.Frame(parent, bg=PANEL_BG, padx=16, pady=16)
         inner.pack(fill="both", expand=True)
+        self._page_intro(
+            inner, "Metadata fetch",
+            "Find titles missing metadata and fetch details, artwork, and people profiles.",
+        )
 
         section_bar = tk.Frame(inner, bg=PANEL_BG)
         section_bar.pack(fill="x", pady=(0, 12))
@@ -602,15 +894,15 @@ class SettingsView(tk.Frame):
         if page == "people":
             self._bulk_media_page.pack_forget()
             self._people_page.pack(fill="both", expand=True)
-            self._people_section_btn.configure(fg=TEXT)
-            self._bulk_section_btn.configure(fg=MUTED)
+            self._people_section_btn.configure(fg="#ffffff", bg=ACCENT)
+            self._bulk_section_btn.configure(fg=MUTED, bg=BTN_BG)
             if not self._people_running:
                 self._refresh_people_list()
         else:
             self._people_page.pack_forget()
             self._bulk_media_page.pack(fill="both", expand=True)
-            self._bulk_section_btn.configure(fg=TEXT)
-            self._people_section_btn.configure(fg=MUTED)
+            self._bulk_section_btn.configure(fg="#ffffff", bg=ACCENT)
+            self._people_section_btn.configure(fg=MUTED, bg=BTN_BG)
             if not self._people_running:
                 self._refresh_bulk_list()
 
@@ -1090,6 +1382,10 @@ class SettingsView(tk.Frame):
     def _build_metadata_editor(self, parent: tk.Frame) -> None:
         inner = tk.Frame(parent, bg=PANEL_BG, padx=16, pady=16)
         inner.pack(fill="both", expand=True)
+        self._page_intro(
+            inner, "Metadata editor",
+            "Review your collection and remove selected metadata or artwork files.",
+        )
 
         header = tk.Frame(inner, bg=PANEL_BG)
         header.pack(fill="x", pady=(0, 12))
@@ -1338,12 +1634,14 @@ class SettingsView(tk.Frame):
         """The movies and series whose story is based on a true story."""
         inner = tk.Frame(parent, bg=PANEL_BG, padx=16, pady=16)
         inner.pack(fill="both", expand=True)
+        self._page_intro(
+            inner, "Dig Deeper",
+            "Explore the real events, people, places, and awards behind your titles.",
+        )
 
         header = tk.Frame(inner, bg=PANEL_BG)
         header.pack(fill="x", pady=(0, 12))
 
-        tk.Label(header, text="Based on a true story", bg=PANEL_BG, fg=TEXT,
-                 font=("Segoe UI Semibold", 12)).pack(side="left")
         self._deeper_status = tk.Label(header, text="", bg=PANEL_BG, fg=MUTED,
                                        font=("Segoe UI", 9), anchor="w", justify="left")
         self._deeper_status.pack(side="left", padx=(10, 0))
@@ -1738,11 +2036,13 @@ class SettingsView(tk.Frame):
         """The quotes of the films in the library."""
         inner = tk.Frame(parent, bg=PANEL_BG, padx=16, pady=16)
         inner.pack(fill="both", expand=True)
+        self._page_intro(
+            inner, "Wikiquote",
+            "Discover memorable lines from films in your library. Select a title to read its quotes.",
+        )
 
         header = tk.Frame(inner, bg=PANEL_BG)
         header.pack(fill="x", pady=(0, 12))
-        tk.Label(header, text="Quotes", bg=PANEL_BG, fg=TEXT,
-                 font=("Segoe UI Semibold", 12)).pack(side="left")
         self._quote_status = tk.Label(header, text="", bg=PANEL_BG, fg=MUTED,
                                       font=("Segoe UI", 9), anchor="w", justify="left")
         self._quote_status.pack(side="left", padx=(10, 0))
@@ -1984,11 +2284,13 @@ class SettingsView(tk.Frame):
         """What is wrong with the library - and how big it is."""
         inner = tk.Frame(parent, bg=PANEL_BG, padx=16, pady=16)
         inner.pack(fill="both", expand=True)
+        self._page_intro(
+            inner, "Library health",
+            "Find missing files, duplicates, and index issues, then review or repair them.",
+        )
 
         header = tk.Frame(inner, bg=PANEL_BG)
         header.pack(fill="x", pady=(0, 12))
-        tk.Label(header, text="Library health", bg=PANEL_BG, fg=TEXT,
-                 font=("Segoe UI Semibold", 12)).pack(side="left")
         self._health_status = tk.Label(header, text="", bg=PANEL_BG, fg=MUTED,
                                        font=("Segoe UI", 9), anchor="w",
                                        justify="left")

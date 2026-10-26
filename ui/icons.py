@@ -150,9 +150,13 @@ def photo(name: str, *, size: int = 16, color: str = "#ffffff",
         probe = Image.new("RGBA", (size * 3, size * 3), (0, 0, 0, 0))
         draw = ImageDraw.Draw(probe)
         box = draw.textbbox((0, 0), g, font=f)
-        img = Image.new("RGBA", (box[2] - box[0], box[3] - box[1]),
+        padding = 1
+        img = Image.new("RGBA", (box[2] - box[0] + 2 * padding,
+                                 box[3] - box[1] + 2 * padding),
                         (0, 0, 0, 0))
-        ImageDraw.Draw(img).text((box[0], box[1]), g, font=f, fill=color)
+        ImageDraw.Draw(img).text(
+            (padding - box[0], padding - box[1]), g, font=f, fill=color,
+        )
         ph = ImageTk.PhotoImage(img)
         _photos[key] = ph
     return ph

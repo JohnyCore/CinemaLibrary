@@ -9,6 +9,7 @@ from typing import Callable
 
 from PIL import Image, ImageTk
 
+from ui.icons import font as icon_font, glyph as icon_glyph
 from utils.image_cache import ImageCache, ImageJob
 
 BG = "#0d0e12"
@@ -29,9 +30,9 @@ ROW_H = CARD_H + GAP_Y
 COL_STEP = CARD_W + GAP_X
 TEXT_WIDTH = CARD_W - 12
 
-# every card is 5 canvas primitives: card rect, poster image, title text,
-# meta text, watched badge
-PRIMS_PER_CARD = 5
+# cards use up to 9 canvas primitives: the card, poster, title, metadata,
+# optional watched badge, and optional rating badge
+PRIMS_PER_CARD = 9
 
 log = logging.getLogger(__name__)
 
@@ -76,6 +77,11 @@ class LibraryView(tk.Frame):
         self._focus_idx: int | None = None
         self._title_font = tkfont.Font(family="Segoe UI Semibold", size=10)
         self._meta_font = tkfont.Font(family="Segoe UI", size=8)
+        self._watched_icon_font = icon_font(8)
+        self._watched_icon = icon_glyph("check")
+        self._rating_icon_font = icon_font(7)
+        self._rating_icon = icon_glyph("star")
+        self._rating_font = tkfont.Font(family="Segoe UI Semibold", size=8)
         self._fit_cache: dict[str, str] = {}
 
         self._profile_panel = tk.Frame(
@@ -307,7 +313,9 @@ class LibraryView(tk.Frame):
         focused = (self._focus_idx is not None
                    and pos == self._pos_of(self._focus_idx))
         selected = item is not None and item.get("id") in self._selected
-        return ACCENT if (focused or selected) else BORDER
+        if focused or selected:
+            return ACCENT
+        return BORDER
 
     def _paint_selection(self) -> None:
         """Show which cards are marked."""
@@ -616,17 +624,37 @@ class LibraryView(tk.Frame):
         kind = "Series" if item.get("media_type") == "series" else "Movie"
         parts = ([str(year), kind] if year else [kind])
         rating = item.get("my_rating")
-        if rating:
-            parts.append(f"★{rating}")
         meta = "  ·  ".join(parts)
         ids.append(self.canvas.create_text(
             (x0 + x1) // 2, y1 - 9, text=meta, anchor="s", fill=MUTED,
             font=self._meta_font, tags=tag,
         ))
-        ids.append(self.canvas.create_text(
-            x1 - 13, y0 + 13, text="✓" if item.get("seen") else "",
-            anchor="ne", fill=ACCENT, font=("Segoe UI", 11, "bold"), tags=tag,
-        ))
+        if rating is not None:
+            badge_x = x0 + 27
+            badge_y = y0 + 20
+            ids.append(self.canvas.create_oval(
+                badge_x - 20, badge_y - 11, badge_x + 20, badge_y + 11,
+                fill="#171914", outline="#51472d", width=1, tags=tag,
+            ))
+            ids.append(self.canvas.create_text(
+                badge_x - 7, badge_y, text=self._rating_icon, anchor="center",
+                fill="#ffd166", font=self._rating_icon_font, tags=tag,
+            ))
+            ids.append(self.canvas.create_text(
+                badge_x + 6, badge_y, text=str(rating), anchor="center",
+                fill="#f2e9d2", font=self._rating_font, tags=tag,
+            ))
+        if item.get("seen"):
+            badge_x = x1 - 20
+            badge_y = y0 + 20
+            ids.append(self.canvas.create_oval(
+                badge_x - 10, badge_y - 10, badge_x + 10, badge_y + 10,
+                fill="#101a19", outline="#38574d", width=1, tags=tag,
+            ))
+            ids.append(self.canvas.create_text(
+                badge_x, badge_y, text=self._watched_icon, anchor="center",
+                fill="#77e0b0", font=self._watched_icon_font, tags=tag,
+            ))
         self._rendered[pos] = ids
         self._rendered_items[pos] = item
         self._request_image(pos, item, token, priority)

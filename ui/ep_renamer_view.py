@@ -44,36 +44,44 @@ class EpRenamerView(tk.Frame):
         inner = tk.Frame(self, bg=PANEL_BG, padx=22, pady=20)
         inner.pack(fill="both", expand=True)
 
-        tk.Label(inner, text="Rename the episode files", bg=PANEL_BG, fg=TEXT,
-                 font=("Segoe UI Semibold", 12)).pack(anchor="w")
+        tk.Label(inner, text="EP Renamer", bg=PANEL_BG, fg=TEXT,
+                 font=("Segoe UI Semibold", 17)).pack(anchor="w")
         tk.Label(
             inner,
             text="The files of a series get the names of the fetched episode "
                  "titles: “The.Mentalist.S02E11.Age.of.Reduction.mkv” becomes "
-                 "“The Mentalist S02E11 - Age of Reduction.mkv”.\n"
-                 "The files keep their place, only the names change - and the "
+                 "“The Mentalist S02E11 - Age of Reduction.mkv”. Files stay in "
+                 "place; only names change. The "
                  "run can be taken back with Undo.",
             bg=PANEL_BG, fg=MUTED, font=("Segoe UI", 9), justify="left",
-        ).pack(anchor="w", pady=(2, 14))
+        ).pack(anchor="w", pady=(3, 14))
 
-        row = tk.Frame(inner, bg=PANEL_BG)
-        row.pack(anchor="w", pady=(0, 10))
-        tk.Label(row, text="Series", bg=PANEL_BG, fg=MUTED,
-                 font=("Segoe UI", 9)).pack(side="left")
+        controls = tk.Frame(
+            inner, bg="#0f1319", highlightthickness=1,
+            highlightbackground=BORDER, padx=14, pady=12,
+        )
+        controls.pack(fill="x", pady=(0, 12))
+        row = tk.Frame(controls, bg="#0f1319")
+        row.pack(fill="x", pady=(0, 10))
+        tk.Label(row, text="Choose a series", bg="#0f1319", fg=MUTED,
+                 font=("Segoe UI", 9)).pack(anchor="w", pady=(0, 5))
         self._combo = ttk.Combobox(row, state="readonly", width=52,
                                    style="Dark.TCombobox")
-        self._combo.pack(side="left", padx=(8, 0))
+        self._combo.pack(fill="x")
         self._combo.bind("<<ComboboxSelected>>", lambda _e: self._plan())
 
-        buttons = tk.Frame(inner, bg=PANEL_BG)
-        buttons.pack(anchor="w", pady=(0, 10))
+        buttons = tk.Frame(controls, bg="#0f1319")
+        buttons.pack(fill="x")
         btn_style = dict(
             bg=BTN_BG, fg=TEXT, activebackground=BTN_ACTIVE, activeforeground=TEXT,
             bd=0, padx=16, pady=6, font=("Segoe UI", 10), cursor="hand2",
         )
         self._apply_btn = tk.Button(
             buttons, text="Apply all", command=self._apply,
-            state="disabled", disabledforeground="#5a6472", **btn_style)
+            state="disabled", disabledforeground="#5a6472",
+            bg=ACCENT, fg=TEXT, activebackground="#f05a60",
+            activeforeground=TEXT, bd=0, padx=16, pady=6,
+            font=("Segoe UI", 10, "bold"), cursor="hand2")
         self._apply_btn.pack(side="left")
         self._undo_btn = tk.Button(
             buttons, text="Undo", command=self._undo,
@@ -84,15 +92,17 @@ class EpRenamerView(tk.Frame):
             **btn_style)
         self._check_btn.pack(side="left", padx=(10, 0))
 
-        self._status = tk.Label(inner, bg=PANEL_BG, fg=MUTED, font=("Segoe UI", 9),
-                                anchor="w", justify="left")
-        self._status.pack(anchor="w", pady=(0, 12))
+        self._status = tk.Label(
+            controls, bg="#0f1319", fg=MUTED, font=("Segoe UI", 9),
+            anchor="w", justify="left",
+        )
+        self._status.pack(anchor="w", pady=(10, 0))
 
         vsb = ttk.Scrollbar(inner, orient="vertical",
                              command=lambda *a: self._tree.yview(*a),
                              style="Dark.Vertical.TScrollbar")
         vsb.pack(side="right", fill="y")
-        wrap = tk.Frame(inner, bg=PANEL_BG, highlightthickness=1,
+        wrap = tk.Frame(inner, bg="#0f1319", highlightthickness=1,
                         highlightbackground=BORDER)
         wrap.pack(side="left", fill="both", expand=True)
         self._tree = ttk.Treeview(

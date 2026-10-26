@@ -231,20 +231,23 @@ class ImageCache:
             self._bump("active")
             name, disk_path = job.name, job.disk
             img: Image.Image | None = None
-            if Path(job.source).is_file():
+            if not job.cancelled and Path(job.source).is_file():
                 if disk_path is not None and disk_path.is_file():
                     img = image_utils.open_rgb(str(disk_path))
                     if img is not None:
                         self._bump("disk_hits")
-                if img is None:
+                if job.cancelled:
+                    img = None
+                elif img is None:
                     t0 = time.perf_counter()
                     img = image_utils.prepare_art(job.source, job.width, job.height,
-                                                  job.mode, contain=job.contain)
+                                                  job.mode, contain=job.contain,
+                                                  is_cancelled=lambda: job.cancelled)
                     ms = int((time.perf_counter() - t0) * 1000)
                     if img is not None:
                         self._bump("generated")
                         self._bump("gen_ms", ms)
-                        if disk_path is not None:
+                        if disk_path is not None and not job.cancelled:
                             try:
                                 img.save(disk_path, "JPEG", quality=82)
                             except (OSError, ValueError):

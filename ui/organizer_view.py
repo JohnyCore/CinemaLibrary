@@ -38,30 +38,35 @@ class OrganizerView(tk.Frame):
         inner = tk.Frame(self, bg=PANEL_BG, padx=22, pady=20)
         inner.pack(fill="both", expand=True)
 
-        tk.Label(inner, text="Sort out a messy folder", bg=PANEL_BG, fg=TEXT,
-                 font=("Segoe UI Semibold", 12)).pack(anchor="w")
+        tk.Label(inner, text="Organizer", bg=PANEL_BG, fg=TEXT,
+                 font=("Segoe UI Semibold", 17)).pack(anchor="w")
         tk.Label(
             inner,
             text="Every loose video file is moved into a folder named after the "
                  "file: a movie into “Title Year Quality”, a series into "
-                 "“Title Quality / Season N”.\n"
-                 "The files are only moved, never renamed. Double click a row to "
+                 "“Title Quality / Season N”. Files are moved, never renamed. "
+                 "Double click a row to "
                  "change the folder name. The episode files of a series are "
                  "renamed in the EP Renamer tab.",
             bg=PANEL_BG, fg=MUTED, font=("Segoe UI", 9), justify="left",
-        ).pack(anchor="w", pady=(2, 14))
+        ).pack(anchor="w", pady=(3, 14))
 
         self._path_var = tk.StringVar(value=self._saved_path())
-        row = tk.Frame(inner, bg=PANEL_BG)
-        row.pack(anchor="w", pady=(0, 10))
-        tk.Label(row, text="Folder", bg=PANEL_BG, fg=MUTED,
-                 font=("Segoe UI", 9)).pack(side="left")
+        controls = tk.Frame(
+            inner, bg="#0f1319", highlightthickness=1,
+            highlightbackground=BORDER, padx=14, pady=12,
+        )
+        controls.pack(fill="x", pady=(0, 12))
+        tk.Label(controls, text="Source folder", bg="#0f1319", fg=TEXT,
+                 font=("Segoe UI Semibold", 10)).pack(anchor="w")
+        row = tk.Frame(controls, bg="#0f1319")
+        row.pack(fill="x", pady=(8, 10))
         self._path_entry = tk.Entry(
             row, textvariable=self._path_var, bg=FIELD_BG, fg=TEXT,
             insertbackground=TEXT, bd=0, highlightthickness=1,
-            highlightbackground=BORDER, font=("Segoe UI", 10), width=52,
+            highlightbackground=BORDER, font=("Segoe UI", 10),
         )
-        self._path_entry.pack(side="left", ipady=5, padx=(8, 0))
+        self._path_entry.pack(side="left", fill="x", expand=True, ipady=6)
         self._path_entry.bind("<Return>", lambda _e: self._scan())
         tk.Button(
             row, text="Browse…", command=self._browse, bg=BTN_BG, fg=TEXT,
@@ -69,14 +74,18 @@ class OrganizerView(tk.Frame):
             padx=14, pady=5, font=("Segoe UI", 9), cursor="hand2",
         ).pack(side="left", padx=(8, 0))
 
-        buttons = tk.Frame(inner, bg=PANEL_BG)
-        buttons.pack(anchor="w", pady=(0, 10))
+        buttons = tk.Frame(controls, bg="#0f1319")
+        buttons.pack(fill="x")
         btn_style = dict(
             bg=BTN_BG, fg=TEXT, activebackground=BTN_ACTIVE, activeforeground=TEXT,
             bd=0, padx=16, pady=6, font=("Segoe UI", 10), cursor="hand2",
         )
-        tk.Button(buttons, text="Scan folder", command=self._scan,
-                  **btn_style).pack(side="left")
+        tk.Button(
+            buttons, text="Scan folder", command=self._scan,
+            bg=ACCENT, fg=TEXT, activebackground="#f05a60",
+            activeforeground=TEXT, bd=0, padx=16, pady=6,
+            font=("Segoe UI", 10, "bold"), cursor="hand2",
+        ).pack(side="left")
         self._organize_btn = tk.Button(
             buttons, text="Organize files", command=self._organize,
             state="disabled", disabledforeground="#5a6472", **btn_style)
@@ -86,15 +95,17 @@ class OrganizerView(tk.Frame):
             state="disabled", disabledforeground="#5a6472", **btn_style)
         self._undo_btn.pack(side="left", padx=(10, 0))
 
-        self._status = tk.Label(inner, bg=PANEL_BG, fg=MUTED, font=("Segoe UI", 9),
-                                anchor="w", justify="left")
-        self._status.pack(anchor="w", pady=(0, 12))
+        self._status = tk.Label(
+            controls, bg="#0f1319", fg=MUTED, font=("Segoe UI", 9),
+            anchor="w", justify="left",
+        )
+        self._status.pack(anchor="w", pady=(10, 0))
 
         vsb = ttk.Scrollbar(inner, orient="vertical",
                              command=lambda *a: self._tree.yview(*a),
                              style="Dark.Vertical.TScrollbar")
         vsb.pack(side="right", fill="y")
-        wrap = tk.Frame(inner, bg=PANEL_BG, highlightthickness=1,
+        wrap = tk.Frame(inner, bg="#0f1319", highlightthickness=1,
                         highlightbackground=BORDER)
         wrap.pack(side="left", fill="both", expand=True)
         columns = ("file", "kind", "target", "result")

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Callable
 from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageOps
@@ -135,12 +136,17 @@ def cover_fit(
 
 
 def prepare_art(
-    path: str, width: int, height: int, mode: str, contain: bool = False
+    path: str, width: int, height: int, mode: str, contain: bool = False,
+    is_cancelled: Callable[[], bool] | None = None,
 ) -> Image.Image | None:
+    if is_cancelled is not None and is_cancelled():
+        return None
     img = open_rgb(path, (width * 2, height * 2))
-    if img is None:
+    if img is None or (is_cancelled is not None and is_cancelled()):
         return None
     img = cover_fit(img, width, height, contain=contain)
+    if is_cancelled is not None and is_cancelled():
+        return None
     if mode == "backdrop":
         img = Image.blend(img, Image.new("RGB", img.size, (10, 12, 16)), 0.55)
     return img

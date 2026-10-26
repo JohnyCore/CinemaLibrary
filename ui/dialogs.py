@@ -16,6 +16,30 @@ FIELD_BG = "#0a0c10"
 BTN_BG = "#1a2130"
 BTN_ACTIVE = "#243046"
 ACCENT = "#e5484d"
+ACCENT_HOVER = "#f05a60"
+
+
+def _action_label(
+    parent, text: str, command, *, bg: str, fg: str,
+    hover_bg: str | None = None, padx: int = 14,
+) -> tk.Label:
+    """A button-like label avoids native button flashes in dark dialogs."""
+    widget = tk.Label(
+        parent, text=text, bg=bg, fg=fg, padx=padx, pady=7,
+        font=("Segoe UI Semibold", 9), cursor="hand2", takefocus=True,
+    )
+
+    def invoke(_event=None):
+        command()
+        return "break"
+
+    widget.bind("<Button-1>", invoke)
+    widget.bind("<Return>", invoke)
+    widget.bind("<space>", invoke)
+    if hover_bg:
+        widget.bind("<Enter>", lambda _event: widget.configure(bg=hover_bg))
+        widget.bind("<Leave>", lambda _event: widget.configure(bg=bg))
+    return widget
 
 
 class ConfirmDialog(tk.Toplevel):
@@ -153,41 +177,63 @@ class PlayerDialog(tk.Toplevel):
         self.transient(master)
         self.result: dict | None = None
 
-        tk.Label(self, text="Name", bg=PANEL_BG, fg=MUTED,
-                 font=("Segoe UI", 9)).pack(anchor="w", padx=20, pady=(16, 2))
-        self._name = tk.Entry(self, bg=FIELD_BG, fg=TEXT, insertbackground=TEXT, bd=0,
-                              highlightthickness=1, highlightbackground=BORDER,
-                              font=("Segoe UI", 10), width=44)
-        self._name.pack(padx=20, fill="x", ipady=5)
+        body = tk.Frame(self, bg=PANEL_BG, padx=24, pady=20)
+        body.pack(fill="both", expand=True)
+        tk.Frame(body, bg=ACCENT, height=3).pack(fill="x", pady=(0, 16))
+        tk.Label(body, text="PLAYBACK", bg=PANEL_BG, fg=ACCENT,
+                 font=("Segoe UI Semibold", 8)).pack(anchor="w")
+        tk.Label(body, text="Add a video player", bg=PANEL_BG, fg=TEXT,
+                 font=("Segoe UI Semibold", 19)).pack(anchor="w", pady=(2, 2))
+        tk.Label(
+            body, text="Choose the application Cinema should use to play your videos.",
+            bg=PANEL_BG, fg=MUTED, font=("Segoe UI", 9),
+        ).pack(anchor="w", pady=(0, 18))
+
+        tk.Label(body, text="PLAYER NAME", bg=PANEL_BG, fg=MUTED,
+                 font=("Segoe UI Semibold", 8)).pack(anchor="w")
+        self._name = tk.Entry(
+            body, bg=FIELD_BG, fg=TEXT, insertbackground=TEXT, bd=0,
+            highlightthickness=1, highlightbackground=BORDER, highlightcolor=ACCENT,
+            font=("Segoe UI", 10),
+        )
+        self._name.pack(fill="x", pady=(5, 14), ipady=7)
         self._name.insert(0, name)
 
-        tk.Label(self, text="Program", bg=PANEL_BG, fg=MUTED,
-                 font=("Segoe UI", 9)).pack(anchor="w", padx=20, pady=(12, 2))
-        row = tk.Frame(self, bg=PANEL_BG)
-        row.pack(padx=20, fill="x")
-        self._path = tk.Entry(row, bg=FIELD_BG, fg=TEXT, insertbackground=TEXT, bd=0,
-                              highlightthickness=1, highlightbackground=BORDER,
-                              font=("Segoe UI", 10))
-        self._path.pack(side="left", fill="x", expand=True, ipady=5)
+        tk.Label(body, text="PROGRAM", bg=PANEL_BG, fg=MUTED,
+                 font=("Segoe UI Semibold", 8)).pack(anchor="w")
+        row = tk.Frame(body, bg=PANEL_BG)
+        row.pack(fill="x", pady=(5, 0))
+        self._path = tk.Entry(
+            row, bg=FIELD_BG, fg=TEXT, insertbackground=TEXT, bd=0,
+            highlightthickness=1, highlightbackground=BORDER, highlightcolor=ACCENT,
+            font=("Segoe UI", 10),
+        )
+        self._path.pack(side="left", fill="x", expand=True, ipady=7)
         self._path.insert(0, path)
-        tk.Button(row, text="Browseâ€¦", command=self._browse, bg=BTN_BG, fg=TEXT,
-                  activebackground=BTN_ACTIVE, activeforeground=TEXT,
-                  bd=0, padx=14, pady=5, font=("Segoe UI", 9), cursor="hand2").pack(
-            side="left", padx=(8, 0))
+        _action_label(
+            row, "Browse…", self._browse, bg=BTN_BG, fg=TEXT,
+            hover_bg=BTN_ACTIVE, padx=12,
+        ).pack(side="left", padx=(8, 0))
 
-        self._status = tk.Label(self, bg=PANEL_BG, fg=ACCENT, font=("Segoe UI", 9),
-                                anchor="w", justify="left")
-        self._status.pack(anchor="w", padx=20, pady=(8, 0))
+        self._status = tk.Label(
+            body, bg=PANEL_BG, fg=ACCENT, font=("Segoe UI", 9),
+            anchor="w", justify="left",
+        )
+        self._status.pack(anchor="w", pady=(8, 0))
 
-        row2 = tk.Frame(self, bg=PANEL_BG)
-        row2.pack(pady=(12, 16))
-        tk.Button(row2, text="Save", command=self._save, bg=ACCENT, fg=TEXT, bd=0,
-                  padx=16, pady=6, cursor="hand2",
-                  font=("Segoe UI", 10)).pack(side="left", padx=6)
-        tk.Button(row2, text="Cancel", command=self.destroy, bg=BTN_BG, fg=TEXT,
-                  activebackground=BTN_ACTIVE, activeforeground=TEXT,
-                  bd=0, padx=16, pady=6, cursor="hand2",
-                  font=("Segoe UI", 10)).pack(side="left", padx=6)
+        row2 = tk.Frame(body, bg=PANEL_BG)
+        row2.pack(fill="x", pady=(18, 0))
+        _action_label(
+            row2, "Save player", self._save, bg=ACCENT, fg=TEXT,
+            hover_bg=ACCENT_HOVER,
+        ).pack(side="right", padx=(8, 0))
+        _action_label(
+            row2, "Cancel", self.destroy, bg=BTN_BG, fg=TEXT,
+            hover_bg=BTN_ACTIVE,
+        ).pack(side="right")
+        self._name.bind("<Return>", lambda _event: self._path.focus_set())
+        self._path.bind("<Return>", lambda _event: self._save())
+        self.bind("<Escape>", lambda _event: self.destroy())
         setup_popup(self, master)
 
     def _browse(self) -> None:
@@ -333,13 +379,24 @@ class PopupMenu(tk.Toplevel):
     BORDER = "#232b36"
     TEXT = "#e8eaed"
     ACTIVE = "#243041"
+    _active_menu: "PopupMenu | None" = None
 
     def __init__(self, master, x: int, y: int, entries) -> None:
+        if PopupMenu._active_menu is not None:
+            PopupMenu._active_menu._dismiss()
         super().__init__(master)
+        PopupMenu._active_menu = self
         self.withdraw()
         self.overrideredirect(True)
         self.configure(bg=self.BORDER)
         self._done = False
+        self._owner = master.winfo_toplevel()
+        self._owner_geometry = self._window_geometry()
+        self._owner_bindings = (
+            self._owner.bind("<Configure>", self._owner_configured, add="+"),
+            self._owner.bind("<FocusOut>", self._owner_focus_out, add="+"),
+            self._owner.bind("<ButtonPress-1>", self._owner_click, add="+"),
+        )
 
         inner = tk.Frame(self, bg=self.BG)
         inner.pack(fill="both", expand=True, padx=1, pady=1)
@@ -365,14 +422,35 @@ class PopupMenu(tk.Toplevel):
         y = min(y, master.winfo_rooty() + master.winfo_height() - height)
         self.geometry(f"+{max(x, 0)}+{max(y, 0)}")
         self.deiconify()
-        try:
-            self.grab_set()
-        except tk.TclError:
-            pass
+
+    def _window_geometry(self) -> tuple[int, int, int, int]:
+        return (
+            self._owner.winfo_rootx(), self._owner.winfo_rooty(),
+            self._owner.winfo_width(), self._owner.winfo_height(),
+        )
+
+    def _owner_configured(self, event=None) -> None:
+        if event is not None and event.widget is not self._owner:
+            return
+        if self._window_geometry() != self._owner_geometry:
+            self._dismiss()
+
+    def _owner_focus_out(self, event=None) -> None:
+        if event is None or event.widget is self._owner:
+            self._dismiss()
+
+    def _owner_click(self, event=None) -> None:
+        if event is None:
+            self._dismiss()
+            return
+        widget = event.widget
+        while widget is not None:
+            if widget is self:
+                return
+            widget = getattr(widget, "master", None)
+        self._dismiss()
 
     def _run(self, command) -> None:
-        # the menu has to go before the command runs: it holds a grab, and
-        # a grab that is not released freezes the whole app
         self._dismiss()
         if command is not None:
             command()
@@ -381,10 +459,17 @@ class PopupMenu(tk.Toplevel):
         if self._done:
             return
         self._done = True
-        try:
-            self.grab_release()
-        except tk.TclError:
-            pass
+        if PopupMenu._active_menu is self:
+            PopupMenu._active_menu = None
+        for sequence, binding_id in zip(
+            ("<Configure>", "<FocusOut>", "<ButtonPress-1>"),
+            self._owner_bindings,
+        ):
+            if binding_id:
+                try:
+                    self._owner.unbind(sequence, binding_id)
+                except tk.TclError:
+                    pass
         try:
             self.destroy()
         except tk.TclError:

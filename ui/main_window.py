@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import queue
+import random
 import re
 import threading
 import time
@@ -19,6 +20,7 @@ from scanner.library_scanner import scan
 from ui.details_view import DetailsView
 from ui.dialogs import ConfirmDialog, PopupMenu, PromptDialog
 from ui.folder_dialog import FolderDialog
+from ui.icons import photo as icon_photo
 from ui.library_view import LibraryView
 from ui.settings_view import SettingsView
 from utils import media_ops
@@ -44,6 +46,7 @@ SECTIONS = (
     ("all", "All Library"),
     ("movie", "Movies"),
     ("series", "TV Series"),
+    ("insights", "Insights"),
 )
 
 
@@ -171,18 +174,20 @@ class MainWindow(tk.Frame):
         self._movies_dir = movies_dir
         self._series_dir = series_dir
         self._q: "queue.Queue[Callable[[], None]]" = queue.Queue()
-        self._wake = threading.Event()
         self._images = ImageCache(config.THUMB_CACHE_DIR, self._post,
                                   config.PLACEHOLDER_PATH)
         self._scan_running = False
         self._rescan_requested = False
         self._closing = False
-        self._drain_pending = False
         self._search_job: str | None = None
         self._search_text = ""
         self._section = "all"
+        self._insights_query = ""
+        self._insights_genre: str | None = None
+        self._insights_continue_only = False
         self._sort_key = 0
         self._all_items: list[dict] = []
+        self._visible_items: list[dict] = []
         self._positions: dict[int, int] = {}
         self._chip_kind: str | None = None
         self._chip_value: str | None = None
@@ -194,10 +199,10 @@ class MainWindow(tk.Frame):
         self.pack(fill="both", expand=True)
         self._build_sidebar()
         self._build_main()
-        self._set_section(self._section)
+        self._show_library()
 
         self._load_from_db()
-        root.after(70, self._drain)
+        root.after(16, self._drain)
         root.bind("<Escape>", self._escape)
         root.after(300, self._rescan_clicked)
 
@@ -212,40 +217,70 @@ class MainWindow(tk.Frame):
         tk.Label(bar, text="local media library", bg=SIDEBAR_BG, fg=MUTED,
                  font=("Segoe UI", 9)).pack(anchor="w", padx=16)
         tk.Frame(bar, bg=BORDER, height=1).pack(fill="x", pady=14, padx=14)
-        self._nav: dict[str, tk.Button] = {}
+        self._nav: dict[str, tk.Label] = {}
         for key, label in SECTIONS:
             self._nav_button(bar, label, key)
         tk.Frame(bar, bg=BORDER, height=1).pack(fill="x", pady=(12, 8), padx=14)
-        tk.Button(
-            bar, text="+ Add Folder", command=self._add_folder,
-            bg="#161d2a", fg=TEXT, activebackground="#243046",
-            activeforeground=TEXT, bd=0, anchor="w", padx=16, pady=6,
-            font=("Segoe UI Semibold", 11), cursor="hand2",
+        self._sidebar_action(
+            bar, "Add Folder", self._add_folder, bg="#161d2a", fg=TEXT,
+            image=icon_photo("folder", size=14, color=TEXT),
         ).pack(fill="x", padx=8)
         self._folder_box = tk.Frame(bar, bg=SIDEBAR_BG)
         self._folder_box.pack(fill="x")
         spacer = tk.Frame(bar, bg=SIDEBAR_BG)
         spacer.pack(fill="both", expand=True)
         tk.Frame(bar, bg=BORDER, height=1).pack(fill="x", padx=14, pady=(0, 8))
-        self._settings_btn = tk.Button(
-            bar, text="Settings", command=self._open_settings,
-            bg=SIDEBAR_BG, fg=MUTED, activebackground=SIDEBAR_BG,
-            activeforeground=TEXT, bd=0, anchor="w", padx=16, pady=6,
-            font=("Segoe UI Semibold", 11), cursor="hand2",
+        self._settings_btn = self._sidebar_action(
+            bar, "Settings", self._open_settings, bg=SIDEBAR_BG, fg=MUTED,
+            image=icon_photo("gear", size=14, color=MUTED),
+            leave_bg=lambda: (
+                "#1a2130" if self._settings.winfo_ismapped() else SIDEBAR_BG
+            ),
         )
         self._settings_btn.pack(fill="x", padx=8, pady=(0, 10))
 
-    def _nav_button(self, parent, label: str, key: str) -> tk.Button:
+    def _sidebar_action(
+        self, parent, label: str, command, *, bg: str, fg: str,
+        image=None, padx: int = 16, leave_bg: Callable[[], str] | None = None,
+    ) -> tk.Label:
+        widget = tk.Label(
+            parent, text=label, image=image, compound="left",
+            bg=bg, fg=fg, bd=0, anchor="w", padx=padx, pady=6,
+            font=("Segoe UI Semibold", 11), cursor="hand2", takefocus=True,
+        )
+
+        def invoke(_event=None):
+            command()
+            return "break"
+
+        widget.bind("<Button-1>", invoke)
+        widget.bind("<Return>", invoke)
+        widget.bind("<space>", invoke)
+        widget.bind("<Enter>", lambda _event: widget.configure(bg="#1a2130"))
+        widget.bind(
+            "<Leave>",
+            lambda _event: widget.configure(bg=leave_bg() if leave_bg else bg),
+        )
+        return widget
+
+    def _nav_button(self, parent, label: str, key: str) -> tk.Label:
         row = tk.Frame(parent, bg=SIDEBAR_BG)
         row.pack(fill="x", padx=8, pady=1)
-        btn = tk.Button(
-            row, text=label, command=lambda k=key: self._set_section(k),
-            bg=SIDEBAR_BG, fg=MUTED, activebackground=SIDEBAR_BG,
-            activeforeground=TEXT, bd=0, anchor="w", padx=8, pady=6,
-            font=("Segoe UI Semibold", 11), cursor="hand2",
+        btn = self._sidebar_action(
+            row, label, lambda k=key: self._navigate_section(k),
+            bg="#1a2130" if self._section == key else SIDEBAR_BG,
+            fg=TEXT if self._section == key else MUTED, padx=8,
         )
         btn.pack(side="left", fill="x", expand=True)
         self._nav[key] = btn
+        btn.bind(
+            "<Enter>",
+            lambda _event, b=btn: b.configure(bg="#243046"),
+            add="+",
+        )
+        btn.bind("<Leave>", lambda _event, k=key, b=btn: b.configure(
+            bg="#1a2130" if self._section == k else SIDEBAR_BG,
+        ), add="+")
         return btn
 
     def _rebuild_folder_nav(self) -> None:
@@ -330,11 +365,12 @@ class MainWindow(tk.Frame):
         )
         self._library = LibraryView(body, self._images, self._open_item,
                                     self._show_context_menu)
+        self._insights = tk.Frame(body, bg=BG)
         self._settings = SettingsView(body, self._on_settings_saved, self._db, self._images,
                                   on_changed=self._on_items_fetched, post=self._post,
                                   on_rescan=self._rescan_clicked,
                                   on_open_item=self._open_item)
-        self._library.pack(fill="both", expand=True)
+        self._render_insights()
 
         status = tk.Frame(column, bg=TOPBAR_BG, height=30)
         status.pack(fill="x", side="bottom")
@@ -354,16 +390,10 @@ class MainWindow(tk.Frame):
     # --- main thread plumbing -----------------------------------------
 
     def _post(self, fn: Callable[[], None]) -> None:
-        """Queue a callback for the main thread.
-
-        Safe to call from a worker thread: Tk is only ever touched from the
-        main thread, which wakes up on the next tick and drains the queue.
-        """
+        """Queue a callback for the main thread without touching Tk from a worker."""
         self._q.put(fn)
-        self._wake.set()
 
     def _drain(self) -> None:
-        self._drain_pending = False
         for _ in range(300):
             try:
                 fn = self._q.get_nowait()
@@ -373,19 +403,17 @@ class MainWindow(tk.Frame):
                 fn()
             except Exception:
                 log.exception("queued callback failed")
-        if not self._q.empty() and not self._closing:
-            self._drain_pending = True
-            self.after_idle(self._drain)
-
-    def _tick(self) -> None:
-        """Main-thread timer: wakes the drain and refreshes the counters."""
         if self._closing:
             return
-        if self._wake.is_set():
-            self._wake.clear()
-            if not self._drain_pending:
-                self._drain_pending = True
-                self.after_idle(self._drain)
+        if not self._q.empty():
+            self.after_idle(self._drain)
+        else:
+            self.after(16, self._drain)
+
+    def _tick(self) -> None:
+        """Refresh the background-work counters."""
+        if self._closing:
+            return
         stats = self._images.stats
         active = stats["active"]
         queued = max(stats["queued"], 0)
@@ -409,6 +437,7 @@ class MainWindow(tk.Frame):
         # the position of every item - a bulk fetch changes hundreds of
         # them and a linear search for each one would be slow
         self._positions = {item.get("id"): i for i, item in enumerate(self._all_items)}
+        self._render_insights()
         self._apply_filters()
 
     def _search_blob(self, item: dict) -> str:
@@ -554,6 +583,24 @@ class MainWindow(tk.Frame):
         query = self._search_text.lower().strip()
         if query:
             items = self._filter_by_query(items, query)
+        if self._insights_query:
+            items = self._filter_by_query(items, self._insights_query)
+        if self._insights_genre:
+            genre = self._insights_genre.casefold()
+            items = [
+                item for item in items
+                if any(
+                    str(value).strip().casefold() == genre
+                    for value in DetailsView._as_list(item.get("genres"))
+                )
+            ]
+        if self._insights_continue_only:
+            items = [
+                item for item in items
+                if item.get("media_type") == "series"
+                and 0 < int(item.get("episodes_watched") or 0)
+                < int(item.get("episodes_total") or 0)
+            ]
         if self._sort_key == 0:
             items.sort(key=lambda i: i.get("_sort") or "")
         elif self._sort_key == 1:
@@ -571,6 +618,9 @@ class MainWindow(tk.Frame):
             items.sort(key=lambda i: -(i.get("last_watched") or 0))
         else:
             items.sort(key=lambda i: -(i.get("my_rating") or 0))
+        if self._insights_continue_only:
+            items.sort(key=lambda i: -(i.get("last_watched") or 0))
+        self._visible_items = items
         self._library.show_items(items, reset_scroll=reset_scroll)
         if not items:
             self._library.set_empty(*self._empty_state())
@@ -583,7 +633,8 @@ class MainWindow(tk.Frame):
         """
         if self._section.startswith("collection:"):
             return "Folder is empty.", "Add Item", self._add_item_to_folder
-        if self._search_text or self._chip_kind:
+        if (self._search_text or self._chip_kind or self._insights_query
+                or self._insights_genre or self._insights_continue_only):
             return "No items match your filters.", None, None
         if self._section == "movie":
             return "No movies in the library yet.", None, None
@@ -610,7 +661,17 @@ class MainWindow(tk.Frame):
         self._db.set_collection(dialog.item_ids, collection_id)
         self._load_from_db()
 
+    def _navigate_section(self, section: str) -> None:
+        if section == "all":
+            self._search_text = ""
+            self._search.delete(0, "end")
+            self._clear_chip()
+        self._set_section(section)
+
     def _set_section(self, section: str) -> None:
+        self._insights_query = ""
+        self._insights_genre = None
+        self._insights_continue_only = False
         self._section = section
         for key, btn in self._nav.items():
             active = key == section
@@ -618,6 +679,16 @@ class MainWindow(tk.Frame):
                 fg=TEXT if active else MUTED,
                 bg="#1a2130" if active else SIDEBAR_BG,
             )
+        if section == "insights":
+            self._details.hide()
+            self._details.pack_forget()
+            self._settings.pack_forget()
+            self._settings_btn.configure(fg=MUTED, bg=SIDEBAR_BG)
+            self._library.pack_forget()
+            self._insights.pack(fill="both", expand=True)
+            self._render_insights()
+            return
+        self._settings_btn.configure(fg=MUTED, bg=SIDEBAR_BG)
         if not self._library.winfo_ismapped():
             self._show_library()
         self._apply_filters(reset_scroll=True)
@@ -655,6 +726,7 @@ class MainWindow(tk.Frame):
 
     def _open_item(self, item: dict) -> None:
         self._settings.pack_forget()
+        self._insights.pack_forget()
         self._settings_btn.configure(fg=MUTED, bg=SIDEBAR_BG)
         self._library.pack_forget()
         # pack the view before it is filled: if building the panel fails,
@@ -669,6 +741,9 @@ class MainWindow(tk.Frame):
         if len(chosen) <= 1:
             chosen = [item]
         many = len(chosen)
+        folder_id = None
+        if self._section.startswith("collection:"):
+            folder_id = int(self._section[11:])
         entries: list[tuple[str | None, object]] = [
             ("Open", lambda: self._open_item(item)),
         ]
@@ -687,11 +762,46 @@ class MainWindow(tk.Frame):
             if many > 1:
                 label = f"Mark {many} items as {'Unwatched' if watched else 'Watched'}"
             entries.append((label, lambda: self._set_watched(chosen, not watched)))
+        if folder_id is not None:
+            folder_items = [
+                media for media in chosen
+                if media.get("collection_id") == folder_id
+            ]
+            if folder_items:
+                entries.append((None, None))
+                entries.append((
+                    "Remove from Folder" if len(folder_items) == 1
+                    else f"Remove {len(folder_items)} items from Folder",
+                    lambda selected=folder_items, cid=folder_id:
+                        self._remove_from_folder(selected, cid),
+                ))
         entries.append((None, None))
         entries.append(("Remove Metadata" if many == 1
                         else f"Remove Metadata of {many} items",
                         lambda: self._remove_metadata(chosen)))
         PopupMenu(self, x, y, entries)
+
+    def _remove_from_folder(self, items: list[dict], collection_id: int) -> None:
+        """Remove selected items from their current folder, keeping them in the library."""
+        media_ids = [item["id"] for item in items]
+        if not media_ids:
+            return
+        removed = self._db.remove_from_collection(media_ids, collection_id)
+        if removed != len(media_ids):
+            log.warning(
+                "removed %s of %s selected items from folder %s; membership may have changed",
+                removed, len(media_ids), collection_id,
+            )
+        self._load_from_db()
+        if removed == len(media_ids):
+            self._status_left.configure(
+                text=f"Removed {removed} item(s) from folder; still in All Library."
+            )
+        else:
+            self._status_left.configure(
+                text=f"Removed {removed} of {len(media_ids)} item(s); "
+                     "some folder assignments may have changed."
+            )
 
     def _folder_menu(self, collection: dict, x: int, y: int) -> None:
         PopupMenu(self, x, y, [
@@ -801,6 +911,342 @@ class MainWindow(tk.Frame):
         self._set_section("all")
         self._set_chip(kind, value)
 
+    def _render_insights(self) -> None:
+        """Render an interactive, scrollable overview of the local library."""
+        for child in self._insights.winfo_children():
+            child.destroy()
+        items = [
+            item for item in self._all_items
+            if item.get("media_type") in ("movie", "series")
+        ]
+        movies = [item for item in items if item.get("media_type") == "movie"]
+        series = [item for item in items if item.get("media_type") == "series"]
+        watched = sum(bool(item.get("seen")) for item in items)
+        episodes_total = sum(int(item.get("episodes_total") or 0) for item in series)
+        episodes_watched = sum(int(item.get("episodes_watched") or 0) for item in series)
+        runtime_total = sum(int(item.get("runtime") or 0) for item in movies)
+        rated = sum(item.get("my_rating") is not None for item in items)
+
+        viewport = tk.Frame(self._insights, bg=BG)
+        viewport.pack(fill="both", expand=True)
+        canvas = tk.Canvas(viewport, bg=BG, highlightthickness=0, bd=0)
+        scrollbar = ttk.Scrollbar(
+            viewport, orient="vertical", command=canvas.yview,
+            style="Dark.Vertical.TScrollbar",
+        )
+        canvas.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        wheel_bindings = []
+        for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            binding_id = canvas.bind_all(
+                sequence,
+                lambda event, v=viewport, c=canvas: self._on_insights_wheel(
+                    event, v, c,
+                ),
+                add="+",
+            )
+            wheel_bindings.append((sequence, binding_id))
+        canvas.bind(
+            "<Destroy>",
+            lambda event, c=canvas, bindings=wheel_bindings:
+                self._unbind_insights_wheel(event, c, bindings),
+        )
+        layout = tk.Frame(canvas, bg=BG, padx=26, pady=24)
+        window = canvas.create_window((0, 0), window=layout, anchor="nw")
+        layout.bind(
+            "<Configure>",
+            lambda _event: canvas.configure(scrollregion=canvas.bbox("all")),
+        )
+        canvas.bind(
+            "<Configure>",
+            lambda event: canvas.itemconfigure(window, width=event.width),
+        )
+
+        heading = tk.Frame(layout, bg=BG)
+        heading.pack(fill="x", pady=(0, 20))
+        tk.Label(
+            heading, text="Your library", bg=BG, fg=TEXT,
+            font=("Segoe UI Semibold", 22),
+        ).pack(anchor="w")
+        tk.Label(
+            heading,
+            text=f"{len(items):,} movies and series · a snapshot of your collection",
+            bg=BG, fg=MUTED, font=("Segoe UI", 10),
+        ).pack(anchor="w", pady=(4, 0))
+
+        cards = tk.Frame(layout, bg=BG)
+        cards.pack(fill="x", pady=(0, 18))
+        for column in range(4):
+            cards.grid_columnconfigure(column, weight=1, uniform="insight-card")
+
+        def metric_card(column: int, title: str, value: str, note: str,
+                        query: str, accent: str) -> None:
+            card = tk.Frame(
+                cards, bg="#12161d", highlightthickness=1,
+                highlightbackground=BORDER, padx=16, pady=13,
+            )
+            card.grid(row=0, column=column, sticky="nsew",
+                      padx=(0 if column == 0 else 6, 6 if column < 3 else 0))
+            tk.Frame(card, bg=accent, height=3).pack(fill="x", pady=(0, 11))
+            title_label = tk.Label(
+                card, text=title.upper(), bg="#12161d", fg=MUTED,
+                font=("Segoe UI Semibold", 8), anchor="w",
+            )
+            title_label.pack(fill="x")
+            value_label = tk.Label(
+                card, text=value, bg="#12161d", fg=TEXT,
+                font=("Segoe UI Semibold", 23), anchor="w",
+            )
+            value_label.pack(fill="x", pady=(4, 0))
+            note_label = tk.Label(
+                card, text=note, bg="#12161d", fg=MUTED,
+                font=("Segoe UI", 9), anchor="w",
+            )
+            note_label.pack(fill="x", pady=(2, 0))
+
+            def open_filter(_event=None, q=query) -> None:
+                self._insights_filter(q)
+
+            def hover(_event=None, frame=card, labels=(title_label, value_label, note_label)):
+                frame.configure(bg="#1a2230")
+                for label in labels:
+                    label.configure(bg="#1a2230")
+
+            def leave(_event=None, frame=card, labels=(title_label, value_label, note_label)):
+                frame.configure(bg="#12161d")
+                for label in labels:
+                    label.configure(bg="#12161d")
+
+            for widget in (card, title_label, value_label, note_label):
+                widget.configure(cursor="hand2")
+                widget.bind("<Button-1>", open_filter)
+                widget.bind("<Enter>", hover)
+                widget.bind("<Leave>", leave)
+
+        metric_card(0, "Movies", f"{len(movies):,}", "Browse your films", "movie", ACCENT)
+        metric_card(1, "Series", f"{len(series):,}", "Browse your shows", "series", "#7c9cff")
+        metric_card(2, "Watched", f"{watched:,}", "Titles with viewing activity",
+                    "watched:yes", "#55c49a")
+        metric_card(3, "To watch", f"{len(items) - watched:,}", "Not started yet",
+                    "unwatched:", "#e4b65c")
+
+        progress_panel = tk.Frame(
+            layout, bg="#12161d", highlightthickness=1, highlightbackground=BORDER,
+            padx=18, pady=16,
+        )
+        progress_panel.pack(fill="x", pady=(0, 18))
+        tk.Label(
+            progress_panel, text="WATCHING PROGRESS", bg="#12161d", fg=TEXT,
+            font=("Segoe UI Semibold", 10),
+        ).pack(anchor="w")
+
+        progress_rows = tk.Frame(progress_panel, bg="#12161d")
+        progress_rows.pack(fill="x", pady=(12, 0))
+
+        def progress_row(parent: tk.Frame, label: str, detail: str,
+                         current: int, maximum: int) -> None:
+            row = tk.Frame(parent, bg="#12161d")
+            row.pack(fill="x", pady=(0, 9))
+            top = tk.Frame(row, bg="#12161d")
+            top.pack(fill="x", pady=(0, 5))
+            tk.Label(top, text=label, bg="#12161d", fg=TEXT,
+                     font=("Segoe UI", 9)).pack(side="left")
+            tk.Label(top, text=detail, bg="#12161d", fg=MUTED,
+                     font=("Segoe UI", 9)).pack(side="right")
+            bar = ttk.Progressbar(
+                row, maximum=max(maximum, 1), value=min(current, maximum),
+                style="Dark.Horizontal.TProgressbar",
+            )
+            bar.pack(fill="x")
+
+        progress_row(progress_rows, "Movies watched", f"{sum(bool(i.get('seen')) for i in movies):,} / {len(movies):,}",
+                     sum(bool(i.get("seen")) for i in movies), len(movies))
+        progress_row(progress_rows, "Episodes watched", f"{episodes_watched:,} / {episodes_total:,}",
+                     episodes_watched, episodes_total)
+
+        continue_items = sorted(
+            (
+                item for item in series
+                if 0 < int(item.get("episodes_watched") or 0)
+                < int(item.get("episodes_total") or 0)
+            ),
+            key=lambda item: item.get("last_watched") or 0,
+            reverse=True,
+        )
+        continue_panel = tk.Frame(
+            layout, bg="#12161d", highlightthickness=1,
+            highlightbackground=BORDER, padx=18, pady=15,
+        )
+        continue_panel.pack(fill="x", pady=(0, 18))
+        continue_header = tk.Frame(continue_panel, bg="#12161d")
+        continue_header.pack(fill="x", pady=(0, 10))
+        tk.Label(
+            continue_header,
+            text=f"Continue watching  ·  {len(continue_items):,}",
+            bg="#12161d", fg=TEXT, font=("Segoe UI Semibold", 11),
+        ).pack(side="left")
+        tk.Button(
+            continue_header, text="View all",
+            command=self._insights_continue_filter,
+            bg="#1a2130", fg=TEXT, activebackground="#243046",
+            activeforeground=TEXT, bd=0, padx=12, pady=5,
+            font=("Segoe UI", 8, "bold"), cursor="hand2",
+        ).pack(side="right")
+        continue_row = tk.Frame(continue_panel, bg="#12161d")
+        continue_row.pack(fill="x")
+        if not continue_items:
+            tk.Label(
+                continue_row, text="No series in progress right now.",
+                bg="#12161d", fg=MUTED, font=("Segoe UI", 9),
+            ).pack(anchor="w", pady=5)
+        for index, item in enumerate(continue_items[:5]):
+            card = tk.Frame(
+                continue_row, bg="#171c25", highlightthickness=1,
+                highlightbackground=BORDER, padx=11, pady=9,
+            )
+            card.pack(
+                side="left", fill="both", expand=True,
+                padx=(0 if index == 0 else 6, 6 if index < 4 else 0),
+            )
+            tk.Button(
+                card, text=item.get("title") or "Untitled",
+                command=lambda selected=item: self._open_item(selected),
+                bg="#171c25", fg=TEXT, activebackground="#202938",
+                activeforeground=TEXT, bd=0, anchor="w", justify="left",
+                wraplength=150, font=("Segoe UI Semibold", 9), cursor="hand2",
+            ).pack(fill="x", anchor="w")
+            tk.Label(
+                card,
+                text=f"{int(item.get('episodes_watched') or 0)} of "
+                     f"{int(item.get('episodes_total') or 0)} episodes watched",
+                bg="#171c25", fg=MUTED, font=("Segoe UI", 8), anchor="w",
+            ).pack(fill="x", pady=(5, 0))
+
+        lower = tk.Frame(layout, bg=BG)
+        lower.pack(fill="x")
+        lower.grid_columnconfigure(0, weight=1, uniform="insight-panel")
+        lower.grid_columnconfigure(1, weight=1, uniform="insight-panel")
+
+        def panel(parent: tk.Frame, column: int, title: str) -> tk.Frame:
+            frame = tk.Frame(
+                parent, bg="#12161d", highlightthickness=1,
+                highlightbackground=BORDER, padx=18, pady=15,
+            )
+            frame.grid(row=0, column=column, sticky="nsew",
+                       padx=(0 if column == 0 else 7, 7 if column == 0 else 0))
+            tk.Label(frame, text=title, bg="#12161d", fg=TEXT,
+                     font=("Segoe UI Semibold", 11)).pack(anchor="w", pady=(0, 10))
+            return frame
+
+        recent_panel = panel(lower, 0, "Recently added")
+        recent = sorted(items, key=lambda item: item.get("added_at") or 0, reverse=True)[:5]
+        if not recent:
+            tk.Label(recent_panel, text="Your library is empty so far.",
+                     bg="#12161d", fg=MUTED, font=("Segoe UI", 9)).pack(anchor="w")
+        for item in recent:
+            year = item.get("year")
+            subtitle = "Series" if item.get("media_type") == "series" else "Movie"
+            if year:
+                subtitle += f" · {year}"
+            row = tk.Frame(recent_panel, bg="#12161d")
+            row.pack(fill="x", pady=2)
+            button = tk.Button(
+                row, text=f"{item.get('title') or 'Untitled'}",
+                command=lambda selected=item: self._open_item(selected),
+                bg="#12161d", fg=TEXT, activebackground="#1a2230",
+                activeforeground=TEXT, bd=0, anchor="w",
+                font=("Segoe UI", 9, "bold"), cursor="hand2",
+            )
+            button.pack(side="left", fill="x", expand=True)
+            tk.Label(row, text=subtitle, bg="#12161d", fg=MUTED,
+                     font=("Segoe UI", 8)).pack(side="right")
+
+        genre_panel = panel(lower, 1, "Popular genres")
+        genre_counts: dict[str, int] = {}
+        for item in items:
+            genres = DetailsView._as_list(item.get("genres"))
+            for genre in set(str(value).strip() for value in genres if str(value).strip()):
+                genre_counts[genre] = genre_counts.get(genre, 0) + 1
+        popular_genres = sorted(
+            genre_counts.items(), key=lambda entry: (-entry[1], entry[0].casefold())
+        )[:6]
+        if not popular_genres:
+            tk.Label(genre_panel, text="Genres appear here when metadata is available.",
+                     bg="#12161d", fg=MUTED, font=("Segoe UI", 9)).pack(anchor="w")
+        for genre, count in popular_genres:
+            row = tk.Frame(genre_panel, bg="#12161d")
+            row.pack(fill="x", pady=2)
+            tk.Button(
+                row, text=genre,
+                command=lambda selected=genre: self._insights_genre_filter(selected),
+                bg="#12161d", fg="#9bb8ff", activebackground="#1a2230",
+                activeforeground=TEXT, bd=0, anchor="w",
+                font=("Segoe UI", 9), cursor="hand2",
+            ).pack(side="left", fill="x", expand=True)
+            tk.Label(row, text=f"{count:,}", bg="#12161d", fg=MUTED,
+                     font=("Segoe UI", 9)).pack(side="right")
+
+        footer = tk.Frame(layout, bg=BG)
+        footer.pack(fill="x", pady=(16, 0))
+        tk.Label(
+            footer,
+            text=f"Known movie runtime  ·  {runtime_total // 60:,}h {runtime_total % 60:02d}m"
+                 f"       ·       {rated:,} titles with your rating",
+            bg=BG, fg=MUTED, font=("Segoe UI", 9),
+        ).pack(anchor="w")
+
+    def _unbind_insights_wheel(self, event, canvas, bindings) -> None:
+        if event.widget is not canvas:
+            return
+        for sequence, binding_id in bindings:
+            if binding_id:
+                canvas.unbind_all(sequence, binding_id)
+
+    def _on_insights_wheel(self, event, viewport, canvas) -> str | None:
+        if not viewport.winfo_ismapped():
+            return None
+        widget = event.widget
+        while widget is not None and widget is not viewport:
+            widget = getattr(widget, "master", None)
+        if widget is not viewport:
+            return None
+
+        button = getattr(event, "num", None)
+        if button == 4:
+            units = -1
+        elif button == 5:
+            units = 1
+        else:
+            delta = getattr(event, "delta", 0)
+            units = -int(delta / 120) if delta else 0
+            if not units and delta:
+                units = -1 if delta > 0 else 1
+        if units:
+            canvas.yview_scroll(units, "units")
+        return "break"
+
+    def _insights_filter(self, query: str) -> None:
+        if query in ("movie", "series"):
+            self._set_section(query)
+            return
+        self._clear_chip()
+        self._set_section("all")
+        self._insights_query = query.strip()
+        self._apply_filters(reset_scroll=True)
+
+    def _insights_continue_filter(self) -> None:
+        self._clear_chip()
+        self._set_section("all")
+        self._insights_continue_only = True
+        self._apply_filters(reset_scroll=True)
+
+    def _insights_genre_filter(self, genre: str) -> None:
+        self._clear_chip()
+        self._set_section("all")
+        self._insights_genre = genre
+        self._apply_filters(reset_scroll=True)
+
     def _show_person_profile(self, name: str, role: str) -> None:
         """Show a person's cached or freshly fetched profile beside the grid."""
         self._show_library()
@@ -884,6 +1330,11 @@ class MainWindow(tk.Frame):
         self._details.hide()
         self._details.pack_forget()
         self._library.pack_forget()
+        self._insights.pack_forget()
+        self._section = "all"
+        self._insights_continue_only = False
+        for btn in self._nav.values():
+            btn.configure(fg=MUTED, bg=SIDEBAR_BG)
         # Pack settings - this will be drawn on next frame
         self._settings.pack(fill="both", expand=True)
         self._settings_btn.configure(fg=TEXT, bg="#1a2130")
@@ -892,6 +1343,7 @@ class MainWindow(tk.Frame):
         # the new folders live in config; pick them up before rescanning
         self._movies_dir = config.MOVIES_DIR
         self._series_dir = config.SERIES_DIR
+        self._load_from_db()
         self._show_library()
         self._rescan_clicked()
 
@@ -899,7 +1351,12 @@ class MainWindow(tk.Frame):
         self._details.hide()
         self._details.pack_forget()
         self._settings.pack_forget()
+        self._insights.pack_forget()
         self._settings_btn.configure(fg=MUTED, bg=SIDEBAR_BG)
+        for key, button in self._nav.items():
+            active = key == self._section
+            button.configure(fg=TEXT if active else MUTED,
+                             bg="#1a2130" if active else SIDEBAR_BG)
         self._library.pack(fill="both", expand=True)
         self._apply_filters()
 
@@ -1021,13 +1478,30 @@ class MainWindow(tk.Frame):
         return " · " + ", ".join(parts) if parts else ""
 
     def _surprise_me(self) -> None:
-        """Pick a random movie that was never watched and show it."""
-        item = self._db.random_unwatched_movie()
-        if item is None:
+        """Pick randomly from the current filtered set, preferring unwatched titles."""
+        current_search = self._search.get().strip()
+        if current_search != self._search_text:
+            self._search_text = current_search
+            self._apply_filters(reset_scroll=True)
+        items = list(self._visible_items)
+        if not items:
             self._status_left.configure(
-                text="Every movie is marked as watched - nothing left to surprise "
-                     "you with.")
+                text="No results match the current library filters.")
             return
+        explicit_watch_filter = (
+            "watched:" in self._search_text.lower()
+            or "unwatched:" in self._search_text.lower()
+            or "watched:" in self._insights_query.lower()
+        )
+        candidates = (
+            items if explicit_watch_filter
+            else [item for item in items if not item.get("seen")]
+        )
+        if not candidates and explicit_watch_filter:
+            self._status_left.configure(
+                text="No titles match the current library filters.")
+            return
+        item = random.choice(candidates or items)
         self._open_item(item)
 
     def _scan_failed(self) -> None:

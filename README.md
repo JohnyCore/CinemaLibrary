@@ -41,23 +41,25 @@ it tells you to install Pillow.
 Click **Settings** at the bottom of the sidebar — it opens a full page inside
 the app with these tabs:
 
-* **General** — the two library folders (Browse dialogs), *Clear Thumbnail
-  Cache*, *Prune Stale Thumbnails*, and the name of the connected metadata
-  provider.
+* **General** — card-based controls for library folders, backup and restore,
+  CSV export, the local data folder, artwork cache maintenance, video player,
+  and metadata provider.
 * **Bulk Fetch** — separate *Movies & Series* and optional *People Profiles*
-  lists. People profiles come from Wikipedia and are cached with their
-  biographies and photos for offline reading.
-* **Metadata Editor** — every item with its metadata badges; you can remove
-  metadata, poster, backdrop or `about.txt` for the selected rows (each
-  removal asks for confirmation first).
+  lists, with clear fetch controls and progress. People profiles come from
+  Wikipedia and are cached with their biographies and photos for offline
+  reading.
+* **Metadata Editor** — a searchable-at-a-glance collection table with
+  metadata badges; remove metadata, poster, backdrop or `about.txt` for
+  selected rows (each removal asks for confirmation first).
 * **Organizer** — sorts a messy folder of loose video files into folders
   named after the files.
 * **EP Renamer** — gives the episode files of a series the names of the
   fetched episode titles.
 * **Dig Deeper** — the movies and series whose story is based on a true
-  story, with the story to read (see below).
-* **Wikiquote** — the quotes of the films in your library.
-* **Library Health** — what is wrong with the library, and how big it is.
+  story, with a two-pane story reader.
+* **Wikiquote** — browse films and read their quotes side by side.
+* **Library Health** — review missing files, duplicates, and index issues,
+  with tools to inspect and repair the library.
 
 <div align='center'>
 <p>
@@ -77,6 +79,13 @@ Everything is stored in `settings.json`, written on first start:
 You can also edit that file directly — then hit **Rescan Library**. This file
 is machine-local; it is listed in `.gitignore` and can also hold API keys
 later (never keys in source code).
+
+Use **Export Backup** in Settings to save a ZIP containing the library
+database and settings. **Restore Backup** validates the archive, database and
+settings before replacing anything, and saves a safety copy of the current
+database and settings alongside the originals. **Export CSV** writes the
+current movie and series list. **Open Data Folder** opens Cinema's local data
+directory in the system file explorer.
 
 ## What it detects
 
@@ -367,11 +376,18 @@ to rate it, click it again to clear it. The rating shows on the poster
 card (`2010  ·  Movie  ·  ★4`) and **My rating high→low** in the sort list
 brings your favourites to the front.
 
+## Insights
+
+The Insights page summarizes your library and includes a **Continue watching**
+row for series with episodes still unwatched. Open a series directly from the
+row or choose **View all** to browse every in-progress series.
+
 ## Surprise me
 
-The button next to **Rescan Library** in the top bar picks a random movie
-you have never watched and opens its page — for the evening when nothing
-comes to mind.
+The button next to **Rescan Library** in the top bar picks a random title from
+the currently filtered library and opens its page. Active section, search,
+genre, watched state, and rating filters are respected; when no watched filter
+is active, Cinema prefers titles you have not watched.
 
 ## Library Health
 

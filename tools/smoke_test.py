@@ -383,6 +383,11 @@ def scanner_db_checks(target: Path) -> None:
     db.sync(items)
     check("a rescan keeps the folder",
           db.get(row["id"])["collection_id"] == collection)
+    second_row = next(r for r in db.load_all() if r["title"] == "Test Movie 6")
+    db.set_collection([second_row["id"]], collection)
+    removed = db.remove_from_collection([second_row["id"]], collection)
+    check("an item can be removed from a folder without deleting it",
+          removed == 1 and db.get(second_row["id"])["collection_id"] is None)
     db.rename_collection(collection, "Anime & Manga")
     check("a folder can be renamed",
           db.list_collections()[0]["name"] == "Anime & Manga")

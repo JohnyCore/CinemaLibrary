@@ -573,6 +573,18 @@ class Database:
                 [(collection_id, mid) for mid in media_ids],
             )
 
+    def remove_from_collection(self, media_ids: list[int], collection_id: int) -> int:
+        """Remove media from one folder without changing unrelated assignments."""
+        if not media_ids:
+            return 0
+        with self.conn:
+            cursor = self.conn.executemany(
+                "UPDATE media SET collection_id=NULL "
+                "WHERE collection_id=? AND id=?",
+                [(collection_id, media_id) for media_id in media_ids],
+            )
+        return cursor.rowcount
+
     def get_unfetched(self) -> list[dict]:
         """Return items missing metadata (no imdb_id and no plot)."""
         rows = self.conn.execute(

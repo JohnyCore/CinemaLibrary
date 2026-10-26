@@ -6,6 +6,7 @@ import webbrowser
 import tkinter as tk
 from datetime import datetime
 from tkinter import font as tkfont
+from tkinter import ttk
 from pathlib import Path
 from typing import Callable
 
@@ -17,7 +18,7 @@ from utils import media_ops
 from utils.image_cache import ImageCache, ImageJob
 from utils.image_utils import find_artwork
 from ui.window_utils import ScrollArea, setup_popup
-from ui.icons import font as icon_font, glyph as icon_glyph
+from ui.icons import font as icon_font, glyph as icon_glyph, photo as icon_photo
 from ui.dialogs import ImdbIdDialog
 
 log = logging.getLogger(__name__)
@@ -86,7 +87,8 @@ class DetailsView(tk.Frame):
         self.canvas.bind("<Configure>", self._on_resize)
 
         self.back_btn = tk.Button(
-            self.canvas, text="←  Back", command=self._back,
+            self.canvas, text="Back", image=icon_photo("back", size=14, color=TEXT),
+            compound="left", command=self._back,
             bg=PANEL_BG, fg=TEXT, activebackground="#1c2230", activeforeground=TEXT,
             bd=0, padx=14, pady=5, font=("Segoe UI", 10), cursor="hand2",
         )
@@ -350,16 +352,13 @@ class DetailsView(tk.Frame):
                 tk.Label(row, text="·", bg=PANEL_BG, fg=MUTED,
                          font=("Segoe UI", 10)).pack(side="left", padx=6)
             if icon:
-                tk.Label(row, text=icon_glyph(icon), bg=PANEL_BG, fg="#e0a33e",
-                         font=icon_font(9)).pack(side="left", padx=(0, 3))
+                self._icon_canvas(row, icon, 9, "#e0a33e").pack(
+                    side="left", padx=(0, 3),
+                )
             imdb_id = str(item.get("imdb_id") or "")
             if icon == "star" and imdb_id.startswith("tt"):
-                tk.Button(
-                    row, text=text,
-                    command=lambda value=imdb_id: self._open_imdb(value),
-                    bg=PANEL_BG, fg=LINK, activebackground=PANEL_BG,
-                    activeforeground=LINK, bd=0, padx=0, pady=0,
-                    font=("Segoe UI", 10), cursor="hand2",
+                self._link(
+                    row, text, lambda value=imdb_id: self._open_imdb(value),
                 ).pack(side="left")
             else:
                 tk.Label(row, text=text, bg=PANEL_BG, fg=MUTED,
@@ -443,16 +442,40 @@ class DetailsView(tk.Frame):
         row = tk.Frame(parent, bg=PANEL_BG)
         tk.Label(row, text="Your Rating:", bg=PANEL_BG, fg=MUTED,
                  font=("Segoe UI", 9)).pack(side="left", padx=(0, 6))
-        stars: list[tk.Button] = []
+        star_font = icon_font(12)
+        star_glyph = icon_glyph("star")
+        star_width = star_font.measure(star_glyph) + 4
+        star_height = star_font.metrics("linespace") + 2
+        stars_canvas = tk.Canvas(
+            row, width=5 * star_width, height=star_height, bg=PANEL_BG,
+            highlightthickness=0, bd=0, cursor="hand2", takefocus=True,
+        )
+        stars: list[tuple[tk.Canvas, int]] = []
         for number in range(1, 6):
-            button = tk.Button(
-                row, text=icon_glyph("star"),
-                command=lambda n=number: self._rate(n),
-                bg=PANEL_BG, fg="#e0a33e", activebackground=PANEL_BG,
-                activeforeground="#f2c069", bd=0, padx=1, pady=0,
-                font=icon_font(12), cursor="hand2")
-            button.pack(side="left")
-            stars.append(button)
+            x = (number - 1) * star_width + star_width // 2
+            star_id = stars_canvas.create_text(
+                x, star_height // 2, text=star_glyph, font=star_font,
+                fill="#3a4150", tags=("rating-star", f"rating-{number}"),
+            )
+            stars.append((stars_canvas, star_id))
+            stars_canvas.tag_bind(
+                star_id, "<Button-1>",
+                lambda _event, n=number: (stars_canvas.focus_set(), self._rate(n)),
+            )
+            stars_canvas.tag_bind(
+                star_id, "<Enter>", lambda _event, n=number: self._hover_stars(n),
+            )
+            stars_canvas.tag_bind(
+                star_id, "<Leave>",
+                lambda _event: self._update_stars(
+                    (self._item or {}).get("my_rating"),
+                ),
+            )
+        for key, rating in (("1", 1), ("2", 2), ("3", 3), ("4", 4), ("5", 5)):
+            stars_canvas.bind(
+                key, lambda _event, n=rating: (self._rate(n), "break")[1],
+            )
+        stars_canvas.pack(side="left")
         tk.Label(row, text="  (click again to clear)", bg=PANEL_BG, fg=MUTED,
                  font=("Segoe UI", 8)).pack(side="left")
         row.pack(anchor="w", pady=(pady, 0))
@@ -463,8 +486,34 @@ class DetailsView(tk.Frame):
         """Fill the stars of the personal rating."""
         stars = self._panel.get("stars") or []
         value = int(rating) if rating else 0
-        for index, button in enumerate(stars):
-            button.configure(fg="#e0a33e" if index < value else "#3a4150")
+        for index, (canvas, star_id) in enumerate(stars):
+            canvas.itemconfigure(
+                star_id, fill="#e0a33e" if index < value else "#3a4150",
+            )
+
+    def _hover_stars(self, rating: int) -> None:
+        for index, (canvas, star_id) in enumerate(self._panel.get("stars") or []):
+            canvas.itemconfigure(
+                star_id, fill="#f2c069" if index < rating else "#3a4150",
+            )
+
+    @staticmethod
+    def _icon_canvas(
+        parent: tk.Misc, icon: str, size: int, color: str,
+    ) -> tk.Canvas:
+        icon_font_value = icon_font(size)
+        glyph = icon_glyph(icon)
+        width = icon_font_value.measure(glyph) + 2
+        height = icon_font_value.metrics("linespace") + 2
+        canvas = tk.Canvas(
+            parent, width=width, height=height, bg=PANEL_BG,
+            highlightthickness=0, bd=0,
+        )
+        canvas.create_text(
+            width // 2, height // 2, text=glyph,
+            font=icon_font_value, fill=color,
+        )
+        return canvas
 
     def _rate(self, rating: int) -> None:
         """Rate the shown item - the same star twice clears the rating."""
@@ -551,13 +600,21 @@ class DetailsView(tk.Frame):
             else:
                 row.pack(anchor="w")
         container.pack(anchor="w", pady=(pady, 0))
-    def _link(self, parent, text: str, command, wraplength: int = 200) -> tk.Button:
-        return tk.Button(
-            parent, text=text, command=command,
-            bg=PANEL_BG, fg=LINK, activebackground=PANEL_BG, activeforeground=LINK,
-            bd=0, padx=0, pady=0, font=("Segoe UI", 9), cursor="hand2",
+    def _link(self, parent, text: str, command, wraplength: int = 200) -> tk.Label:
+        link = tk.Label(
+            parent, text=text, bg=PANEL_BG, fg=LINK,
+            font=("Segoe UI", 9), cursor="hand2", takefocus=True,
             wraplength=wraplength, justify="left",
         )
+
+        def invoke(_event=None):
+            command()
+            return "break"
+
+        link.bind("<Button-1>", invoke)
+        link.bind("<Return>", invoke)
+        link.bind("<space>", invoke)
+        return link
 
     def _open_imdb(self, imdb_id: str) -> None:
         try:
@@ -723,14 +780,35 @@ class DetailsView(tk.Frame):
         picker.title("Choose a title")
         picker.configure(bg=PANEL_BG)
         picker.transient(self)
-        box = tk.Frame(picker, bg=PANEL_BG, padx=16, pady=14)
+        box = tk.Frame(picker, bg=PANEL_BG, padx=24, pady=20)
         box.pack(fill="both", expand=True)
-        tk.Label(box, text="Several titles match — pick the right one:",
-                 bg=PANEL_BG, fg=TEXT, font=("Segoe UI", 10)).pack(anchor="w", pady=(0, 8))
-        listbox = tk.Listbox(box, bg="#0f1319", fg=TEXT, highlightthickness=1,
-                              highlightbackground=BORDER, font=("Segoe UI", 10),
-                              width=52, height=min(12, len(candidates)))
-        listbox.pack(fill="both", expand=True)
+        tk.Frame(box, bg=ACCENT, height=3).pack(fill="x", pady=(0, 16))
+        tk.Label(box, text="METADATA MATCH", bg=PANEL_BG, fg=ACCENT,
+                 font=("Segoe UI Semibold", 8)).pack(anchor="w")
+        tk.Label(box, text="Choose a title", bg=PANEL_BG, fg=TEXT,
+                 font=("Segoe UI Semibold", 19)).pack(anchor="w", pady=(2, 2))
+        tk.Label(
+            box, text="Several matches were found. Select the correct film or series.",
+            bg=PANEL_BG, fg=MUTED, font=("Segoe UI", 9),
+        ).pack(anchor="w", pady=(0, 14))
+
+        list_frame = tk.Frame(
+            box, bg="#0d1117", highlightthickness=1, highlightbackground=BORDER,
+        )
+        list_frame.pack(fill="both", expand=True)
+        listbox = tk.Listbox(
+            list_frame, bg="#0d1117", fg=TEXT, selectbackground="#293650",
+            selectforeground=TEXT, activestyle="none", highlightthickness=0,
+            bd=0, font=("Segoe UI", 10), width=52,
+            height=min(8, max(3, len(candidates))), exportselection=False,
+        )
+        scrollbar = ttk.Scrollbar(
+            list_frame, orient="vertical", command=listbox.yview,
+            style="Dark.Vertical.TScrollbar",
+        )
+        listbox.configure(yscrollcommand=scrollbar.set)
+        listbox.pack(side="left", fill="both", expand=True, padx=(8, 0), pady=6)
+        scrollbar.pack(side="right", fill="y", padx=(0, 4), pady=4)
         for c in candidates:
             label = f"{c.title or '?'}"
             if c.year:
@@ -739,6 +817,8 @@ class DetailsView(tk.Frame):
                 label += f"  [{c.imdb_id}]"
             listbox.insert("end", label)
         listbox.selection_set(0)
+        listbox.activate(0)
+        listbox.focus_set()
 
         def choose() -> None:
             sel = listbox.curselection()
@@ -756,12 +836,38 @@ class DetailsView(tk.Frame):
             self._set_status("Cancelled.")
 
         row = tk.Frame(box, bg=PANEL_BG)
-        row.pack(pady=(10, 0))
-        tk.Button(row, text="Use this", command=choose, bg=ACCENT, fg=TEXT,
-                  bd=0, padx=12, pady=5, cursor="hand2").pack(side="left", padx=(0, 8))
-        tk.Button(row, text="Cancel", command=cancel, bg="#1a2130",
-                  fg=TEXT, bd=0, padx=12, pady=5, cursor="hand2").pack(side="left")
+        row.pack(fill="x", pady=(14, 0))
+        self._dialog_action_label(
+            row, "Use this title", choose, bg=ACCENT, fg=TEXT,
+            hover_bg="#f05a60",
+        ).pack(side="right", padx=(8, 0))
+        self._dialog_action_label(
+            row, "Cancel", cancel, bg="#1a2130", fg=TEXT,
+            hover_bg="#243046",
+        ).pack(side="right")
+        listbox.bind("<Double-Button-1>", lambda _event: choose())
+        listbox.bind("<Return>", lambda _event: choose())
+        picker.bind("<Escape>", lambda _event: cancel())
         setup_popup(picker, self)
+
+    @staticmethod
+    def _dialog_action_label(parent, text: str, command, *, bg: str, fg: str,
+                             hover_bg: str) -> tk.Label:
+        widget = tk.Label(
+            parent, text=text, bg=bg, fg=fg, padx=14, pady=7,
+            font=("Segoe UI Semibold", 9), cursor="hand2", takefocus=True,
+        )
+
+        def invoke(_event=None):
+            command()
+            return "break"
+
+        widget.bind("<Button-1>", invoke)
+        widget.bind("<Return>", invoke)
+        widget.bind("<space>", invoke)
+        widget.bind("<Enter>", lambda _event: widget.configure(bg=hover_bg))
+        widget.bind("<Leave>", lambda _event: widget.configure(bg=bg))
+        return widget
 
     def _fetch_selected(self, candidate, media_id: int, generation: int,
                         overwrite_artwork: bool) -> None:
@@ -1090,12 +1196,12 @@ class DetailsView(tk.Frame):
         source = item.get("poster2_path") or item.get("poster_path")
         self._bg_job = self._images.get_backdrop(
             source, (width, height), self._apply_bg, priority=0,
-            disk_cache=False,
         )
 
     def _apply_bg(self, image) -> None:
         if not self.winfo_exists() or image is None:
             return
+        self._bg_job = None
         # the view keeps the picture: the Tk image must not die with the
         # cache entry it came from
         self._bg_image = image
@@ -1104,7 +1210,8 @@ class DetailsView(tk.Frame):
         else:
             self.canvas.itemconfig(self._bg_id, image=image)
         self.canvas.tag_lower(self._bg_id)
-        self._refresh_panel_backdrop()
+        if self._resize_job is None:
+            self._refresh_panel_backdrop()
 
     def _refresh_panel_backdrop(self) -> None:
         """Draw a tinted crop of the backdrop behind the panel's widgets."""
@@ -1182,13 +1289,14 @@ class DetailsView(tk.Frame):
         self._resize_job = None
         if not self.winfo_exists() or self._item is None:
             return
-        self._refresh_panel_backdrop()
         width = self.canvas.winfo_width()
         height = self.canvas.winfo_height()
         if width < 2 or height < 2:
             return
         if (width, height) != self._last_geo:
             self._load_backdrop()
+        elif self._bg_job is None:
+            self._refresh_panel_backdrop()
 
     def _back(self) -> None:
         self._on_back()
