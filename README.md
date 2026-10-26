@@ -2,11 +2,11 @@
 
 <div align='center'>
 <p>
-  <img width="720" src="https://i.imgur.com/Oeae7ZO.jpeg" />
+  <img width="720" src="https://i.imgur.com/6jbHtFw.jpeg" />
 </p>
 
 <p>
-  <img width="480" src="https://i.imgur.com/acWJCVj.png" /> <img width="480" src="https://i.imgur.com/CzeDl06.png" />
+  <img width="480" src="https://imgur.com/Lt4ud9k.png" /> <img width="480" src="https://i.imgur.com/vyaZhWZ.png" />
 </p>
 </div>
 
@@ -63,7 +63,7 @@ the app with these tabs:
 
 <div align='center'>
 <p>
-  <img width="480" src="https://i.imgur.com/FV0moWo.png" />
+  <img width="480" src="https://i.imgur.com/gsLpsNA.png" />
 </p>
 </div>
 
