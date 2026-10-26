@@ -158,7 +158,7 @@ class LibraryView(tk.Frame):
         self.canvas.bind("<Control-a>", self._on_select_all)
         # the wheel handler is global, but it is only this view's: it is
         # removed again when the view goes away
-        self.bind_all("<MouseWheel>", self._on_wheel, add="+")
+        self._wheel_id = self.bind_all("<MouseWheel>", self._on_wheel, add="+")
         self.bind("<Destroy>", self._unbind_wheel)
 
         # the empty state sits over the canvas: a message and a button
@@ -174,8 +174,9 @@ class LibraryView(tk.Frame):
 
     def _unbind_wheel(self, event=None) -> None:
         """Drop the global wheel binding when the view goes away."""
+        from ui.window_utils import unbind_bindall
         try:
-            self.unbind_all("<MouseWheel>")
+            unbind_bindall(self, "<MouseWheel>", getattr(self, "_wheel_id", None))
         except Exception:
             pass
 

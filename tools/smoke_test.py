@@ -7,6 +7,7 @@ Run from the cinema folder:
 from __future__ import annotations
 
 import dataclasses
+import sqlite3
 import shutil
 import sys
 import tempfile
@@ -23,6 +24,7 @@ from scanner.library_scanner import scan  # noqa: E402
 from tools.make_test_library import build  # noqa: E402
 from utils import image_utils, title_parser as tp  # noqa: E402
 from utils import organizer  # noqa: E402
+from ui.ep_renamer_view import _needs_name_fetch  # noqa: E402
 
 failures = 0
 
@@ -73,6 +75,15 @@ def parse_checks() -> None:
     check("year not eaten from title", p[0] == "2001: A Space Odyssey" and p[1] is None)
     check("clean_for_search", tp.clean_for_search(
         "The.Matrix.1999.1080p.BluRay.x264-GROUP", 1999) == "The Matrix")
+    check("metadata clean_query removes release tags",
+          metadata_service.MetadataService.clean_query(
+              "The.Matrix.1999.1080p.BluRay.x264-GROUP", 1999) == "The Matrix")
+    check("name refresh is needed for empty episode titles",
+          _needs_name_fetch({(1, 1): "Pilot", (1, 2): ""}))
+    check("name refresh skips fully named episodes",
+          not _needs_name_fetch({(1, 1): "Pilot", (1, 2): "Finale"}))
+    check("name refresh still checks series without episode rows",
+          _needs_name_fetch({}))
     check("SAE", tp.episode_numbers("S01E01 Pilot.mkv", None) == (1, 1))
     check("sxey", tp.episode_numbers("show 2x13.mkv", None) == (2, 13))
     check("inherited season", tp.episode_numbers("Episode 5.mkv", 3) == (3, 5))
@@ -268,6 +279,38 @@ def scanner_db_checks(target: Path) -> None:
     eps_db = db.episodes(series_id)
     check("episodes in db", len(eps_db) > 0)
     check("episodes expose series_id", "series_id" in eps_db[0])
+
+    conn = db.conn
+    conn.executemany(
+        "INSERT INTO episodes(series_id, season, episode, path) VALUES(?, ?, ?, ?)",
+        [(series_id, 999, 1, "smoke-old-1"), (series_id, 999, 2, "smoke-old-2")],
+    )
+    conn.execute(
+        "CREATE TRIGGER smoke_fail_episode_rename BEFORE UPDATE OF path ON episodes "
+        "WHEN NEW.path='smoke-new-2' "
+        "BEGIN SELECT RAISE(ABORT, 'intentional smoke failure'); END"
+    )
+    conn.commit()
+    rename_failed = False
+    try:
+        db.rename_episodes([
+            ("smoke-old-1", "smoke-new-1"),
+            ("smoke-old-2", "smoke-new-2"),
+        ])
+    except sqlite3.IntegrityError:
+        rename_failed = True
+    rolled_back = [
+        row["path"] for row in conn.execute(
+            "SELECT path FROM episodes WHERE series_id=? AND season=999 ORDER BY episode",
+            (series_id,),
+        )
+    ]
+    check("episode path batch rolls back atomically",
+          rename_failed and rolled_back == ["smoke-old-1", "smoke-old-2"])
+    conn.execute("DROP TRIGGER smoke_fail_episode_rename")
+    conn.execute("DELETE FROM episodes WHERE series_id=? AND season=999", (series_id,))
+    conn.commit()
+
     db.set_episode_watched(eps_db[0]["path"], True)
     check("watched flag persists",
           any(e["watched"] == 1 for e in db.episodes(series_id)))
@@ -329,8 +372,7 @@ def scanner_db_checks(target: Path) -> None:
     moved = [p for p in plan if p.result == "renamed"]
     check("every planned rename worked",
           moved_count == len(moved) and len(moved) == len(renameable))
-    for entry in moved:
-        db.rename_episode(str(entry.source), str(entry.target))
+    db.rename_episodes([(str(entry.source), str(entry.target)) for entry in moved])
     check("the database follows the renames",
           {str(p.target) for p in moved} <= {
               r["path"] for r in db.episodes(series_id)})
@@ -339,8 +381,7 @@ def scanner_db_checks(target: Path) -> None:
           len(organizer.load_undo()) == len(moved))
     back = organizer.undo_episode_renames(organizer.load_undo())
     check("the renames were taken back", back == len(moved))
-    for entry in moved:
-        db.rename_episode(str(entry.target), str(entry.source))
+    db.rename_episodes([(str(entry.target), str(entry.source)) for entry in moved])
     organizer.clear_undo()
     check("a taken-back library is as before",
           {r["path"] for r in db.episodes(series_id)} == before)
@@ -890,6 +931,14 @@ def ui_checks(target: Path) -> None:
             root.update()
             check("the health tab shows the items of an issue",
                   len(app._settings._health_items.get_children()) >= 0)
+            app._settings._health_missing = [app._db.get(movie["id"])]
+            app._settings._health_issues.selection_set("missing")
+            app._settings._on_health_issue()
+            health_iid = app._settings._health_items.get_children()[0]
+            app._settings._health_items.selection_set(health_iid)
+            check("health item IDs are namespaced and mapped",
+                  health_iid == f"media:{movie['id']}"
+                  and app._settings._selected_health_media_id() == movie["id"])
 
             # the database can be checked, compacted and copied
             app._settings._check_database()
@@ -953,9 +1002,25 @@ def ui_checks(target: Path) -> None:
             film.write_bytes(b"x")
             org = app._settings._organizer
             org._path_var.set(str(messy))
+            remembered_paths = []
+            org._remember_path = remembered_paths.append
             org._scan()
-            root.update()
+            for _ in range(60):
+                root.update()
+                if not org._running:
+                    break
+                time.sleep(0.05)
             check("the organizer plans the file", bool(org._entries))
+            check("automatic organizer scan does not remember its path",
+                  remembered_paths == [])
+            org._scan(remember=True)
+            for _ in range(60):
+                root.update()
+                if not org._running:
+                    break
+                time.sleep(0.05)
+            check("an explicit organizer scan remembers its path",
+                  remembered_paths == [messy])
             if org._entries:
                 moved_to = messy / org._entries[0].target
                 moved_to.parent.mkdir(parents=True, exist_ok=True)

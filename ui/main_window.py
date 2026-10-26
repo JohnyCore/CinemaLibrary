@@ -1199,9 +1199,9 @@ class MainWindow(tk.Frame):
     def _unbind_insights_wheel(self, event, canvas, bindings) -> None:
         if event.widget is not canvas:
             return
+        from ui.window_utils import unbind_bindall
         for sequence, binding_id in bindings:
-            if binding_id:
-                canvas.unbind_all(sequence, binding_id)
+            unbind_bindall(canvas, sequence, binding_id)
 
     def _on_insights_wheel(self, event, viewport, canvas) -> str | None:
         if not viewport.winfo_ismapped():
@@ -1283,7 +1283,7 @@ class MainWindow(tk.Frame):
 
             self._post(apply)
 
-        threading.Thread(target=worker, daemon=True).start()
+        threading.Thread(target=self._db.thread_target(worker), daemon=True).start()
 
     def _set_chip(self, kind: str, value: str) -> None:
         self._chip_kind = kind
@@ -1461,7 +1461,7 @@ class MainWindow(tk.Frame):
 
             self._post(done)
 
-        threading.Thread(target=worker, daemon=True).start()
+        threading.Thread(target=self._db.thread_target(worker), daemon=True).start()
 
     @staticmethod
     def _diff_text(diff) -> str:

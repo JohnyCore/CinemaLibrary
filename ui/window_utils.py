@@ -5,6 +5,25 @@ import tkinter as tk
 from tkinter import ttk
 
 
+def unbind_bindall(widget: tk.Misc, sequence: str, funcid) -> None:
+    """Remove ONE global binding, keeping the others.
+
+    The old unbind_all(sequence, funcid) form stopped working in Python 3.13
+    (TypeError); the same edit is done here against the Tcl side so that
+    views can drop their own binding without stripping the rest of the app.
+    """
+    if not funcid:
+        return
+    lines = str(widget.tk.call("bind", "all", sequence)).split("\n")
+    prefix = f'if {{"[{funcid} '
+    keep = "\n".join(line for line in lines if not line.startswith(prefix))
+    widget.tk.call("bind", "all", sequence, keep)
+    try:
+        widget.deletecommand(funcid)
+    except tk.TclError:
+        pass
+
+
 class ScrollArea(tk.Frame):
     """A scrollable region: a canvas with a frame inside it.
 
@@ -45,7 +64,7 @@ class ScrollArea(tk.Frame):
                 pass
             self._smooth_job = None
         try:
-            self.unbind_all("<MouseWheel>", self._wheel_id)
+            unbind_bindall(self, "<MouseWheel>", self._wheel_id)
         except Exception:
             pass
 

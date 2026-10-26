@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import threading
 import tkinter as tk
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from tkinter import ttk
 
 from metadata import metadata_service
@@ -22,6 +22,10 @@ ACCENT = "#e5484d"
 
 def _short(text: str) -> str:
     return text if len(text) <= 70 else text[:67] + "…"
+
+
+def _needs_name_fetch(names: dict[tuple, str]) -> bool:
+    return not names or any(not name.strip() for name in names.values())
 
 
 class EpRenamerView(tk.Frame):
@@ -190,17 +194,17 @@ class EpRenamerView(tk.Frame):
             try:
                 organizer.rename_episode_files(todo)
                 moves = [(e.source, e.target) for e in todo if e.result == "renamed"]
-                for old, new in moves:
-                    self._db.rename_episode(str(old), str(new))
+                db_moves = [(str(old), str(new)) for old, new in moves]
+                self._db.rename_episodes(db_moves)
                 if moves:
-                    organizer.save_undo([(str(old), str(new)) for old, new in moves])
+                    organizer.save_undo(db_moves)
             except Exception:
                 log.exception("the renames could not be saved")
                 self._post(self._failed)
                 return
             self._post(self._applied)
 
-        threading.Thread(target=worker, daemon=True).start()
+        threading.Thread(target=self._db.thread_target(worker), daemon=True).start()
 
     def _applied(self) -> None:
         self._running = False
@@ -235,8 +239,8 @@ class EpRenamerView(tk.Frame):
         def worker() -> None:
             try:
                 back = organizer.undo_episode_renames(moves)
-                for old, new in moves:
-                    self._db.rename_episode(str(new), str(old))
+                self._db.rename_episodes(
+                    [(str(new), str(old)) for old, new in moves])
                 organizer.clear_undo()
             except Exception:
                 log.exception("the undo could not be saved")
@@ -244,7 +248,7 @@ class EpRenamerView(tk.Frame):
                 return
             self._post(lambda: self._undone(back, len(moves)))
 
-        threading.Thread(target=worker, daemon=True).start()
+        threading.Thread(target=self._db.thread_target(worker), daemon=True).start()
 
     def _undone(self, back: int, total: int) -> None:
         self._running = False
@@ -281,6 +285,8 @@ class EpRenamerView(tk.Frame):
             sid = item["id"]
             title = str(item.get("title") or "?")
             before = self._name_stats(sid)
+            if not _needs_name_fetch(before):
+                return (title, True, 0)
             try:
                 query = metadata_service.MetadataService.clean_query(
                     str(item.get("title") or ""), item.get("year"))
@@ -307,8 +313,9 @@ class EpRenamerView(tk.Frame):
             titles_in = 0
             pool = ThreadPoolExecutor(max_workers=4)
             try:
-                futures = {pool.submit(worker, item): item for item in series}
-                for future in list(futures):
+                run_worker = self._db.thread_target(worker)
+                futures = {pool.submit(run_worker, item): item for item in series}
+                for future in as_completed(futures):
                     title, ok, came_in = future.result()
                     done += 1
                     if ok and came_in:

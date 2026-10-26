@@ -1027,7 +1027,7 @@ class SettingsView(tk.Frame):
             self._post(lambda d=done, f=failures, t=len(people), c=cancelled:
                        self._people_fetch_finished(d, f, t, c))
 
-        threading.Thread(target=worker, daemon=True).start()
+        threading.Thread(target=self._db.thread_target(worker), daemon=True).start()
 
     def _people_row_done(self, name: str, status: str, done: int, total: int) -> None:
         key = person_key(name)
@@ -1262,7 +1262,7 @@ class SettingsView(tk.Frame):
                         if nxt is None:
                             exhausted = True
                             break
-                        pending.add(pool.submit(worker, nxt))
+                        pending.add(pool.submit(self._db.thread_target(worker), nxt))
                     if not pending:
                         break
                     finished, pending = wait(pending, return_when=FIRST_COMPLETED)
@@ -1875,7 +1875,7 @@ class SettingsView(tk.Frame):
             self._db.set_story_cache(media_id, story)
             self._post(lambda: self._story_cached(media_id))
 
-        threading.Thread(target=worker, daemon=True).start()
+        threading.Thread(target=self._db.thread_target(worker), daemon=True).start()
 
     def _story_cached(self, media_id: int) -> None:
         """The story arrived - show it, if it is still the selected one."""
@@ -1927,7 +1927,7 @@ class SettingsView(tk.Frame):
                 self._post(lambda d=done: self._deeper_progress.configure(value=d))
             self._post(lambda: self._stories_cached(done, len(todo)))
 
-        threading.Thread(target=worker, daemon=True).start()
+        threading.Thread(target=self._db.thread_target(worker), daemon=True).start()
 
     def _stories_cached(self, done: int, total: int) -> None:
         self._deeper_running = False
@@ -1983,7 +1983,7 @@ class SettingsView(tk.Frame):
                 state["done"], len(flagged), len(items),
                 self._deeper_cancel.is_set(), flagged))
 
-        threading.Thread(target=worker, daemon=True).start()
+        threading.Thread(target=self._db.thread_target(worker), daemon=True).start()
 
     def _scan_progress_state(self, done: int, total: int, item: dict) -> None:
         """Show what the scan is doing right now."""
@@ -2215,7 +2215,7 @@ class SettingsView(tk.Frame):
                 self._post(lambda d=done: self._quote_progress.configure(value=d))
             self._post(lambda: self._quotes_finished(done, found, len(items)))
 
-        threading.Thread(target=worker, daemon=True).start()
+        threading.Thread(target=self._db.thread_target(worker), daemon=True).start()
 
     def _quote_batch(self, chunk: list[dict]) -> dict | None:
         """The quotes of a batch of films - waiting out a throttled answer."""
@@ -2315,6 +2315,8 @@ class SettingsView(tk.Frame):
         self._health_dupes_btn.pack(side="right", padx=(8, 0))
         self._health_missing: list[dict] = []
         self._health_size: int | None = None
+        self._health_measuring = False
+        self._health_item_ids: dict[str, int] = {}
 
         body = tk.Frame(inner, bg=PANEL_BG)
         body.pack(fill="both", expand=True)
@@ -2524,20 +2526,31 @@ class SettingsView(tk.Frame):
             parts.append(f"{runtime // 60} h of runtime")
         if rated:
             parts.append(f"{rated} rated")
-        if self._health_size is not None:
-            parts.append(f"{self._health_size / 1e9:.0f} GB of video")
-        else:
-            parts.append("measuring the size…")
+        parts.append("measuring the size…")
         self._health_status.configure(text=" · ".join(parts))
 
+        if self._health_measuring:
+            return
+        self._health_measuring = True
+
         def worker() -> None:
-            size, missing = self._db.disk_report()
+            try:
+                size, missing = self._db.disk_report()
+            except Exception:
+                log.exception("health disk report failed")
+                self._post(self._health_measurement_failed)
+                return
             self._post(lambda: self._health_details(missing, size))
 
-        threading.Thread(target=worker, daemon=True).start()
+        threading.Thread(target=self._db.thread_target(worker), daemon=True).start()
+
+    def _health_measurement_failed(self) -> None:
+        self._health_measuring = False
+        self._health_status.configure(text="The library size could not be measured.")
 
     def _health_details(self, missing: list[dict], size: int) -> None:
         """The files that are gone and the size of the library."""
+        self._health_measuring = False
         self._health_missing = missing
         self._health_size = size
         text = self._health_status.cget("text").replace(
@@ -2553,11 +2566,13 @@ class SettingsView(tk.Frame):
         if not selection:
             for iid in self._health_items.get_children():
                 self._health_items.delete(iid)
+            self._health_item_ids.clear()
             self._update_health_buttons()
             return
         issue = selection[0]
         for iid in self._health_items.get_children():
             self._health_items.delete(iid)
+        self._health_item_ids.clear()
         items = (self._health_missing if issue == "missing"
                  else self._db.health_items(issue))
         for index, item in enumerate(items):
@@ -2566,10 +2581,18 @@ class SettingsView(tk.Frame):
                 title += f"  —  {item['detail']}"
             year = item.get("year") or ""
             kind = "Series" if item.get("media_type") == "series" else "Movie"
+            iid = f"media:{item['id']}"
+            self._health_item_ids[iid] = item["id"]
             self._health_items.insert(
-                "", "end", iid=str(item["id"]), values=(title, year, kind),
+                "", "end", iid=iid, values=(title, year, kind),
                 tags=("odd",) if index % 2 else ())
         self._update_health_buttons()
+
+    def _selected_health_media_id(self) -> int | None:
+        selection = self._health_items.selection()
+        if not selection:
+            return None
+        return self._health_item_ids.get(selection[0])
 
     def _on_health_item_select(self, event=None) -> None:
         """The buttons of the item list follow the selection."""
@@ -2580,10 +2603,10 @@ class SettingsView(tk.Frame):
         issues = self._health_issues.selection()
         if not issues or issues[0] not in ("gaps", "future"):
             return
-        selection = self._health_items.selection()
-        if not selection:
+        media_id = self._selected_health_media_id()
+        if media_id is None:
             return
-        item = self._db.get(int(selection[0]))
+        item = self._db.get(media_id)
         if item is None or item.get("media_type") != "series":
             return
         self._redetect_series_files(item)
@@ -2643,9 +2666,9 @@ class SettingsView(tk.Frame):
 
     def _open_health_details(self) -> None:
         """Show the selected item in the details page of the app."""
-        selection = self._health_items.selection()
-        if not selection or self._on_open_item is None:
+        media_id = self._selected_health_media_id()
+        if media_id is None or self._on_open_item is None:
             return
-        item = self._db.get(int(selection[0]))
+        item = self._db.get(media_id)
         if item is not None:
             self._on_open_item(item)

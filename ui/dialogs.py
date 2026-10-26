@@ -300,6 +300,7 @@ class DuplicateResolver(tk.Toplevel):
         inner = area.inner
         for group in groups:
             title = group.get("title") or "?"
+            key = str(title)
             tk.Label(inner, text=title, bg=PANEL_BG, fg=ACCENT,
                      font=("Segoe UI", 9, "bold")).pack(anchor="w", pady=(8, 2))
             buttons = []
@@ -314,8 +315,8 @@ class DuplicateResolver(tk.Toplevel):
                 label.bind("<Button-1>",
                            lambda _e, g=group, p=item["path"]: self._choose(g, p))
                 buttons.append((item["path"], label))
-            self._buttons[str(group["title"])] = buttons
-            self._keep[str(group["title"])] = self._best(group)["path"]
+            self._buttons[key] = buttons
+            self._keep[key] = self._best(group)["path"]
         self._keep_best()
 
         row = tk.Frame(self, bg=PANEL_BG)
@@ -437,6 +438,15 @@ class PopupMenu(tk.Toplevel):
 
     def _owner_focus_out(self, event=None) -> None:
         if event is None or event.widget is self._owner:
+            try:
+                x, y = self.winfo_pointerxy()
+                widget = self.winfo_containing(x, y)
+                while widget is not None:
+                    if widget is self:
+                        return
+                    widget = getattr(widget, "master", None)
+            except tk.TclError:
+                pass
             self._dismiss()
 
     def _owner_click(self, event=None) -> None:
@@ -451,9 +461,13 @@ class PopupMenu(tk.Toplevel):
         self._dismiss()
 
     def _run(self, command) -> None:
+        owner = self._owner
         self._dismiss()
         if command is not None:
-            command()
+            # a real click still holds Tk's automatic button grab here, which
+            # makes a dialog opened right now fail to show/grab - run outside
+            # the press dispatch instead
+            owner.after(20, command)
 
     def _dismiss(self, _event=None) -> None:
         if self._done:

@@ -53,6 +53,12 @@ def main() -> None:
         root.destroy()
 
     root.protocol("WM_DELETE_WINDOW", on_close)
+    # exceptions inside Tk callbacks are printed to a console that
+    # pythonw users never see - put them in the log instead
+    def _log_callback_error(exc, val, tb) -> None:
+        log.exception("uncaught Tk callback error", exc_info=(exc, val, tb))
+
+    root.report_callback_exception = _log_callback_error
     root.mainloop()
     try:
         db.close()

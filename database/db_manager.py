@@ -7,11 +7,14 @@ import random
 import sqlite3
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
+from typing import TypeVar
 
 from utils.path_utils import canonical_path
 
 log = logging.getLogger(__name__)
+_T = TypeVar("_T")
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS media (
@@ -51,7 +54,6 @@ CREATE INDEX IF NOT EXISTS idx_media_type ON media(media_type);
 CREATE INDEX IF NOT EXISTS idx_media_title ON media(title COLLATE NOCASE);
 CREATE INDEX IF NOT EXISTS idx_media_root ON media(root);
 CREATE INDEX IF NOT EXISTS idx_media_path ON media(path);
-CREATE INDEX IF NOT EXISTS idx_episodes_path ON episodes(path);
 CREATE TABLE IF NOT EXISTS collections (
     id INTEGER PRIMARY KEY,
     name TEXT NOT NULL UNIQUE
@@ -69,6 +71,7 @@ CREATE TABLE IF NOT EXISTS episodes (
     watched INTEGER NOT NULL DEFAULT 0,
     last_watched REAL
 );
+CREATE INDEX IF NOT EXISTS idx_episodes_path ON episodes(path);
 CREATE TABLE IF NOT EXISTS ignored (
     path TEXT PRIMARY KEY
 );
@@ -215,6 +218,30 @@ class Database:
             with self._conn_lock:
                 self._all_conns.append(conn)
         return conn
+
+    def close_thread_conn(self) -> None:
+        """Close and unregister the calling thread's connection."""
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            return
+        self._local.conn = None
+        with self._conn_lock:
+            if conn in self._all_conns:
+                self._all_conns.remove(conn)
+        try:
+            conn.close()
+        except sqlite3.Error:
+            log.exception("error closing thread database connection")
+
+    def thread_target(self, target: Callable[..., _T]) -> Callable[..., _T]:
+        """Wrap a worker target so its thread-local connection is released."""
+        def run(*args, **kwargs) -> _T:
+            try:
+                return target(*args, **kwargs)
+            finally:
+                self.close_thread_conn()
+
+        return run
 
     def _migrate(self) -> None:
         cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(media)")}
@@ -688,6 +715,16 @@ class Database:
         with self.conn:
             self.conn.execute(
                 "UPDATE episodes SET path=? WHERE path=?", (new_path, old_path))
+
+    def rename_episodes(self, moves: list[tuple[str, str]]) -> None:
+        """Update paths for a batch of renamed episode files atomically."""
+        if not moves:
+            return
+        with self.conn:
+            self.conn.executemany(
+                "UPDATE episodes SET path=? WHERE path=?",
+                [(new_path, old_path) for old_path, new_path in moves],
+            )
 
     def set_episode_watched(self, path: str, watched: bool) -> None:
         with self.conn:

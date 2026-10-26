@@ -67,7 +67,7 @@ class OrganizerView(tk.Frame):
             highlightbackground=BORDER, font=("Segoe UI", 10),
         )
         self._path_entry.pack(side="left", fill="x", expand=True, ipady=6)
-        self._path_entry.bind("<Return>", lambda _e: self._scan())
+        self._path_entry.bind("<Return>", lambda _e: self._scan(remember=True))
         tk.Button(
             row, text="Browse…", command=self._browse, bg=BTN_BG, fg=TEXT,
             activebackground=BTN_ACTIVE, activeforeground=TEXT, bd=0,
@@ -80,12 +80,13 @@ class OrganizerView(tk.Frame):
             bg=BTN_BG, fg=TEXT, activebackground=BTN_ACTIVE, activeforeground=TEXT,
             bd=0, padx=16, pady=6, font=("Segoe UI", 10), cursor="hand2",
         )
-        tk.Button(
-            buttons, text="Scan folder", command=self._scan,
+        self._scan_btn = tk.Button(
+            buttons, text="Scan folder", command=lambda: self._scan(remember=True),
             bg=ACCENT, fg=TEXT, activebackground="#f05a60",
             activeforeground=TEXT, bd=0, padx=16, pady=6,
             font=("Segoe UI", 10, "bold"), cursor="hand2",
-        ).pack(side="left")
+        )
+        self._scan_btn.pack(side="left")
         self._organize_btn = tk.Button(
             buttons, text="Organize files", command=self._organize,
             state="disabled", disabledforeground="#5a6472", **btn_style)
@@ -150,7 +151,7 @@ class OrganizerView(tk.Frame):
                                          title="Select folder")
         if chosen:
             self._path_var.set(chosen)
-            self._scan()
+            self._scan(remember=True)
 
     def _source(self) -> Path | None:
         raw = self._path_var.get().strip()
@@ -165,15 +166,48 @@ class OrganizerView(tk.Frame):
 
     # --- scanning -----------------------------------------------------
 
-    def _scan(self) -> None:
+    def _scan(self, remember: bool = False) -> None:
         if self._running:
             return
         source = self._source()
         if source is None:
             return
+        self._running = True
+        self._scan_btn.configure(state="disabled")
+        self._organize_btn.configure(state="disabled")
+        self._undo_btn.configure(state="disabled")
+        self._status.configure(text=f"Scanning {source}…")
+
+        def worker() -> None:
+            try:
+                entries = organizer.plan(source)
+            except Exception:
+                log.exception("could not scan organizer folder %s", source)
+                self._post(lambda: self._scan_failed(source))
+                return
+            self._post(lambda: self._show_scan(source, entries, remember))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _scan_failed(self, source: Path) -> None:
+        self._running = False
+        self._scan_btn.configure(state="normal")
+        has_todo = any(entry.kind != "skip" for entry in self._entries)
+        self._organize_btn.configure(
+            state="normal" if source == self._scanned and has_todo else "disabled")
+        self._undo_btn.configure(state="normal" if self._last_moved else "disabled")
+        self._status.configure(text=f"Could not scan {source}. See the application log.")
+
+    def _show_scan(
+        self, source: Path, entries: list[organizer.PlanEntry], remember: bool = False,
+    ) -> None:
+        self._running = False
+        self._scan_btn.configure(state="normal")
+        self._undo_btn.configure(state="normal" if self._last_moved else "disabled")
         self._scanned = source
-        self._entries = organizer.plan(source)
-        self._remember_path(source)
+        self._entries = entries
+        if remember:
+            self._remember_path(source)
 
         for iid in self._tree.get_children():
             self._tree.delete(iid)
@@ -224,11 +258,19 @@ class OrganizerView(tk.Frame):
         self._status.configure(text=f"Moving 0/{len(todo)}…")
 
         def worker() -> None:
-            for index, entry in enumerate(todo, 1):
-                organizer.move_entry(entry, source)
-                self._post(lambda i=index: self._status.configure(
-                    text=f"Moving {i}/{len(todo)}…"))
-            self._post(self._finished)
+            try:
+                for index, entry in enumerate(todo, 1):
+                    try:
+                        organizer.move_entry(entry, source)
+                    except Exception as exc:
+                        entry.result = f"failed: {exc}"
+                        log.exception("could not organize %s", entry.source)
+                    self._post(lambda i=index: self._status.configure(
+                        text=f"Moving {i}/{len(todo)}…"))
+            except Exception:
+                log.exception("organizer run failed")
+            finally:
+                self._post(self._finished)
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -273,17 +315,18 @@ class OrganizerView(tk.Frame):
 
         def worker() -> None:
             back = 0
-            for origin, target in moves:
-                try:
+            try:
+                for origin, target in moves:
                     if target.exists() and not origin.exists():
                         origin.parent.mkdir(parents=True, exist_ok=True)
                         shutil.move(str(target), str(origin))
                         # the folder the file went into is empty now
                         organizer.drop_empty(target.parent, source)
                         back += 1
-                except OSError as exc:
-                    log.warning("could not move %s back: %s", target, exc)
-            self._post(lambda: self._undone(back, len(moves)))
+            except Exception:
+                log.exception("organizer undo failed")
+            finally:
+                self._post(lambda: self._undone(back, len(moves)))
 
         threading.Thread(target=worker, daemon=True).start()
 

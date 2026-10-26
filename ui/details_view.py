@@ -744,7 +744,7 @@ class DetailsView(tk.Frame):
             self._post(self._fetch_finished(media_id, result, error,
                                             art_error, generation, overwrite_artwork))
 
-        threading.Thread(target=worker, daemon=True).start()
+        threading.Thread(target=self._db.thread_target(worker), daemon=True).start()
 
     def _apply_artwork(self, media_id: int, media_path: str, media_type: str,
                        result, overwrite_artwork: bool):
@@ -900,7 +900,7 @@ class DetailsView(tk.Frame):
             self._post(self._fetch_finished(media_id, result, error,
                                             art_error, generation, overwrite_artwork))
 
-        threading.Thread(target=worker, daemon=True).start()
+        threading.Thread(target=self._db.thread_target(worker), daemon=True).start()
 
     def _fetch_finished(self, media_id, result, error, art_error, generation,
                         overwrite_artwork):
