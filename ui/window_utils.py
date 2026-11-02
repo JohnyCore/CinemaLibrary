@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import logging
 import sys
 import tkinter as tk
 from tkinter import ttk
+
+log = logging.getLogger(__name__)
 
 
 def unbind_bindall(widget: tk.Misc, sequence: str, funcid) -> None:
@@ -66,7 +69,7 @@ class ScrollArea(tk.Frame):
         try:
             unbind_bindall(self, "<MouseWheel>", self._wheel_id)
         except Exception:
-            pass
+            log.debug("could not drop the wheel binding", exc_info=True)
 
     def _scrollregion(self) -> tuple:
         """The region to scroll, never smaller than the window.
@@ -208,7 +211,7 @@ def set_dark_title_bar(widget: tk.Misc) -> None:
         dwm.DwmSetWindowAttribute(hwnd, 35, ctypes.byref(caption), 4)
         dwm.DwmSetWindowAttribute(hwnd, 36, ctypes.byref(text), 4)
     except Exception:
-        pass
+        log.debug("the dark title bar is not available", exc_info=True)
 
 
 def center_window(win: tk.Toplevel, parent: tk.Misc | None = None) -> None:

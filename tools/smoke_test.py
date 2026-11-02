@@ -58,6 +58,32 @@ def find_button(widget, text: str):
     return None
 
 
+def find_widget(widget, text: str):
+    """First widget of any kind - label, button, canvas row - with that text."""
+    for child in widget.winfo_children():
+        try:
+            if str(child.cget("text")) == text:
+                return child
+        except tk.TclError:
+            pass
+        found = find_widget(child, text)
+        if found is not None:
+            return found
+    return None
+
+
+def widget_text(widget) -> str:
+    """Every label text inside a container, joined - the meta line is a row."""
+    parts: list[str] = []
+    for child in widget.winfo_children():
+        try:
+            parts.append(str(child.cget("text")))
+        except tk.TclError:
+            pass
+        parts.append(widget_text(child))
+    return "  ".join(p for p in parts if p)
+
+
 def check(label: str, cond: bool) -> None:
     global failures
     tag = "ok" if cond else "FAIL"
@@ -265,6 +291,26 @@ def scanner_db_checks(target: Path) -> None:
     db.conn.execute("UPDATE media SET story_cache=NULL WHERE id=?", (row["id"],))
     db.conn.commit()
     check("the cache can be cleared", db.story_cache(row["id"]) == {})
+
+    # a record of nothing counts as nothing
+    db.set_story_cache(row["id"], {"real": None, "places": [], "movie": ""})
+    check("an empty story is not cached", db.story_cache(row["id"]) == {})
+
+    # a different article means a different story: the old one is dropped
+    db.set_true_story(row["id"], True, "Old Article (film)")
+    db.set_story_cache(row["id"], {"real": "The old story."})
+    db.set_true_story(row["id"], True, "Old Article (film)")
+    check("the same article keeps the story",
+          db.story_cache(row["id"]).get("real") == "The old story.")
+    db.set_true_story(row["id"], True, "New Article (film)")
+    check("a new article drops the story", db.story_cache(row["id"]) == {})
+
+    # a new identity means the story belonged to another film
+    db.set_story_cache(row["id"], {"real": "The old story."})
+    db.save_metadata(row["id"], {
+        "imdb_id": "tt9999999", "title": "Test Movie 0", "plot": "A plot."})
+    check("a new imdb id drops the story", db.story_cache(row["id"]) == {})
+    db.set_true_story(row["id"], True, "Old Article (film)")
 
     # --- the library health report ---
     counts = db.health_counts()
@@ -632,8 +678,6 @@ def organizer_checks(target: Path) -> None:
 
 
 def ui_checks(target: Path) -> None:
-    from ui.library_view import PRIMS_PER_CARD
-
     image_utils.ensure_placeholder(config.PLACEHOLDER_PATH)
     config.THUMB_CACHE_DIR = target / "thumbs"
     # a player of the user would be started by the play button - the test
@@ -666,8 +710,11 @@ def ui_checks(target: Path) -> None:
                 lib.canvas.yview_scroll(55, "units")
             lib.canvas.update()
             check("grid created visible cards", 0 < len(lib._rendered) <= 60)
+            # a card draws between 3 and 9 primitives (badges are optional),
+            # so the canvas must hold exactly the items the view remembers
+            drawn = sum(len(ids) for ids in lib._rendered.values())
             check("no orphan canvas items",
-                  len(lib.canvas.find_all()) == len(lib._rendered) * PRIMS_PER_CARD)
+                  drawn > 0 and len(lib.canvas.find_all()) == drawn)
             next(i for i in app._all_items if i["media_type"] == "movie")
             app._set_section("movie")
             root.update()
@@ -693,18 +740,23 @@ def ui_checks(target: Path) -> None:
             check("the episode panel has seasons", bool(seasons))
             if seasons:
                 name = seasons[0]
-                app._details._ep_open[name] = False
-                movie_item = next(i for i in app._all_items
-                                  if i["media_type"] == "movie")
-                app._details.show(movie_item)
+                # an open season survives the panel being rebuilt for new
+                # facts (same item, new signature)
+                app._details._ep_open[name] = True
+                app._details.show(series_item)
+                root.update()
+                app._db.save_metadata(series_item["id"],
+                                      {"plot": "A plot for the rebuild."})
+                series_item = app._db.get(series_item["id"]) or series_item
                 app._details.show(series_item)
                 root.update()
                 check("the episode panel keeps the selected season",
-                      app._details._ep_open.get(name) is False)
+                      app._details._ep_open.get(name) is True
+                      and name in app._details._ep_seasons)
 
                 # a short episode list must not float inside its canvas:
                 # scrolling up would push the seasons down
-                area = app._details._ep_area
+                area = app._details._upper
                 header = app._details._ep_seasons[name]["header"]
                 top = header.winfo_rooty() - area.canvas.winfo_rooty()
                 area.canvas.yview_scroll(-5, "units")
@@ -739,15 +791,15 @@ def ui_checks(target: Path) -> None:
                         root.update()
                         before = False
                     stars = app._details._panel["stars"]
-                    row_y = stars[0].winfo_rooty()
+                    row_y = stars[0][0].winfo_rooty()
                     rows[path]["watched"][0].invoke()
                     root.update()
                     after = any(e["path"] == path and e["watched"]
                                 for e in app._db.episodes(series_item["id"]))
                     check("the watched button marks the episode", before != after)
                     check("the panel keeps its margins when an episode is marked",
-                          stars[0].winfo_rooty() == row_y)
-                    meta = str(app._details._panel["meta"].cget("text"))
+                          stars[0][0].winfo_rooty() == row_y)
+                    meta = widget_text(app._details._panel["meta"])
                     check("the meta line keeps the episode count",
                           "watched" in meta and "1/" in meta)
 
@@ -774,7 +826,7 @@ def ui_checks(target: Path) -> None:
             root.update()
             check("the view toggles are gone", not hasattr(app, "_view_buttons"))
             check("the sidebar has an add-folder button",
-                  find_button(app, "+ Add Folder") is not None)
+                  find_widget(app, "Add Folder") is not None)
 
             # the scan says what it changed
             check("the status line tells what the scan found",
@@ -866,16 +918,44 @@ def ui_checks(target: Path) -> None:
             check("the pane does not wait for the network",
                   "Looking up" not in pane)
 
+            # a flagged title with no article says so, instead of asking to cache
+            app._db.set_true_story(movie["id"], True, "")
+            app._db.conn.execute(
+                "UPDATE media SET story_cache=NULL WHERE id=?", (movie["id"],))
+            # the settings view keeps its rows between visits - come back in
+            app._show_library()
+            root.update()
+            app._open_settings()
+            root.update()
+            app._settings._select_tab("deeper")
+            root.update()
+            app._settings._deeper_tree.selection_set(str(movie["id"]))
+            app._settings._on_deeper_select()
+            root.update()
+            pane = app._settings._deeper_text.get("1.0", "end")
+            check("a title with no article says there is no story",
+                  "no article about it was found" in pane
+                  and "press Cache the stories" not in pane)
+
             # the personal rating is set from the details page
+            app._open_item(app._db.get(movie["id"]) or movie)
+            root.update()
             stars = app._details._panel.get("stars") or []
             check("the details page has five stars", len(stars) == 5)
             if stars:
-                stars[2].invoke()
+                # the stars live on one canvas - the click handler is _rate
+                canvas, star_id = stars[2]
+                app._details._rate(3)
                 root.update()
                 check("a star rates the item",
                       app._db.get(movie["id"])["my_rating"] == 3)
+                check("the lit star is filled",
+                      canvas.itemcget(star_id, "fill") == "#e0a33e")
+                app._details._rate(3)
+                root.update()
                 check("the same star clears the rating",
-                      stars[2].cget("fg") == "#e0a33e")
+                      app._db.get(movie["id"])["my_rating"] is None
+                      and canvas.itemcget(star_id, "fill") == "#3a4150")
 
             # the surprise button opens a movie that was never watched
             app._show_library()
@@ -1199,10 +1279,14 @@ def ui_checks(target: Path) -> None:
             finish()
             return
         check("chooser opens for an ambiguous title", True)
-        cancel = find_button(pickers[0], "Cancel")
+        # the dialog buttons are labels with a click binding, not tk.Button
+        cancel = find_widget(pickers[0], "Cancel")
         check("chooser offers a cancel button", cancel is not None)
         if cancel is not None:
-            cancel.invoke()
+            if isinstance(cancel, tk.Button):
+                cancel.invoke()
+            else:
+                cancel.event_generate("<Button-1>")
             root.update()
             check("cancelling re-enables the fetch button",
                   str(app._details._fetch_btn.cget("state")) == "normal")
@@ -1278,22 +1362,41 @@ def ui_checks(target: Path) -> None:
     check("ui smoke completed", results == ["done"])
 
 
+SECTIONS = ("parse", "story", "scan", "organizer", "ui")
+
+
 def main() -> None:
     import argparse
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--ui", action="store_true", help="also run invisible UI test")
     parser.add_argument("--target", default=None)
+    parser.add_argument("--only", default="",
+                        help=f"comma-separated sections to run: {', '.join(SECTIONS)}")
     args = parser.parse_args()
+
+    wanted = {s.strip() for s in args.only.split(",") if s.strip()}
+    unknown = wanted - set(SECTIONS)
+    if unknown:
+        parser.error(f"unknown section(s): {', '.join(sorted(unknown))}")
+
+    def run(section: str) -> bool:
+        return not wanted or section in wanted
 
     target = Path(args.target or tempfile.mkdtemp(prefix="cinema_smoke_"))
     fresh = args.target is None
     build(target)
-    parse_checks()
-    true_story_checks()
-    scanner_db_checks(target)
-    organizer_checks(target)
-    if args.ui:
+    if run("parse"):
+        parse_checks()
+    if run("story"):
+        true_story_checks()
+    if run("scan"):
+        scanner_db_checks(target)
+    if run("organizer"):
+        organizer_checks(target)
+    if args.ui and run("ui"):
         ui_checks(target)
+    elif wanted == {"ui"}:
+        print("--only ui needs --ui")
     if fresh:
         shutil.rmtree(target, ignore_errors=True)
     if failures:

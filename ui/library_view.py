@@ -30,10 +30,6 @@ ROW_H = CARD_H + GAP_Y
 COL_STEP = CARD_W + GAP_X
 TEXT_WIDTH = CARD_W - 12
 
-# cards use up to 9 canvas primitives: the card, poster, title, metadata,
-# optional watched badge, and optional rating badge
-PRIMS_PER_CARD = 9
-
 log = logging.getLogger(__name__)
 
 
@@ -178,7 +174,7 @@ class LibraryView(tk.Frame):
         try:
             unbind_bindall(self, "<MouseWheel>", getattr(self, "_wheel_id", None))
         except Exception:
-            pass
+            log.debug("could not drop the wheel binding", exc_info=True)
 
     # --- public API ---------------------------------------------------
 
@@ -327,7 +323,7 @@ class LibraryView(tk.Frame):
             try:
                 self.canvas.itemconfig(ids[0], outline=self._outline_for(pos))
             except tk.TclError:
-                pass
+                log.debug("card %s is gone - its outline is skipped", pos)
 
     # --- layout -------------------------------------------------------
 

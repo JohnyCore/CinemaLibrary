@@ -8,7 +8,7 @@ dependencies = ["Pillow>=10.0"]
 [tool.ruff]
 line-length = 100
 target-version = "py311"
-exclude = ["data", "graphify-out", "__pycache__"]
+exclude = ["data", "graphify-out", "__pycache__", "archive"]
 
 [tool.ruff.lint]
 # the checks the smoke test relies on: pyflakes errors + syntax errors

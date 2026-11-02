@@ -22,7 +22,8 @@ from metadata.person_profiles import fetch_person_profile, person_key
 from utils import media_ops
 from utils.image_cache import BACKDROP_SIZES, ImageCache
 from utils.image_utils import find_artwork
-from ui.dialogs import ConfirmDialog, DuplicateResolver, ImdbIdDialog, PlayerDialog
+from ui.dialogs import (ConfirmDialog, DuplicateResolver, ImdbIdDialog,
+                        PlayerDialog, PopupMenu)
 from ui.ep_renamer_view import EpRenamerView
 from ui.library_view import POSTER_H, POSTER_W
 from ui.organizer_view import OrganizerView
@@ -1694,6 +1695,7 @@ class SettingsView(tk.Frame):
         self._deeper_tree.configure(yscrollcommand=vsb.set)
         self._deeper_tree.pack(side="left", fill="both", expand=True)
         self._deeper_tree.bind("<<TreeviewSelect>>", self._on_deeper_select)
+        self._deeper_tree.bind("<Button-3>", self._deeper_menu)
 
         read = tk.Frame(body, bg=PANEL_BG, highlightthickness=1,
                         highlightbackground=BORDER)
@@ -1732,13 +1734,26 @@ class SettingsView(tk.Frame):
         rvsb.pack(side="right", fill="y")
         self._deeper_text.pack(side="left", fill="both", expand=True)
         self._deeper_items: dict[int, dict] = {}
+        self._deeper_loaded = False
         self._deeper_running = False
         self._deeper_cancel = threading.Event()
 
-    def _refresh_deeper_list(self) -> int:
-        """Reload the flagged items from the database."""
+    def refresh_cached_lists(self) -> None:
+        """Forget the rows kept between visits - the database moved on."""
+        self._deeper_loaded = False
+
+    def _refresh_deeper_list(self, force: bool = False) -> int:
+        """Reload the flagged items from the database.
+
+        The list is rebuilt only when the flags changed: switching tabs must
+        not throw away the selected title and the story being read.
+        """
+        if not force and self._deeper_loaded:
+            return len(self._deeper_items)
+        selected = self._deeper_tree.selection()
         items = self._db.true_story_items()
         self._deeper_items = {int(i["id"]): i for i in items}
+        self._deeper_loaded = True
         for iid in self._deeper_tree.get_children():
             self._deeper_tree.delete(iid)
         for idx, item in enumerate(items):
@@ -1748,8 +1763,13 @@ class SettingsView(tk.Frame):
             self._deeper_tree.insert(
                 "", "end", iid=str(item["id"]), values=(title, year, kind),
                 tags=("odd",) if idx % 2 else ())
-        self._deeper_buttons(False)
-        self._set_deeper_text(("body", "Pick a title to read about it."))
+        keep = [iid for iid in selected if iid in self._deeper_items]
+        if keep:
+            self._deeper_tree.selection_set(keep[0])
+            self._on_deeper_select()
+        else:
+            self._deeper_buttons(False)
+            self._set_deeper_text(("body", "Pick a title to read about it."))
         return len(items)
 
     def _set_deeper_text(self, *blocks: tuple[str, str]) -> None:
@@ -1807,6 +1827,33 @@ class SettingsView(tk.Frame):
             return
         self._on_open_item(item)
 
+    def _deeper_menu(self, event) -> None:
+        """Right-click on a title: open it, or drop a wrong verdict."""
+        iid = self._deeper_tree.identify_row(event.y)
+        if not iid:
+            return
+        self._deeper_tree.selection_set(iid)
+        item = self._deeper_items.get(int(iid))
+        if item is None:
+            return
+        folder = media_ops.media_folder(item)
+        entries = [("Open Details Page", self._open_deeper_details)]
+        if folder is not None:
+            entries.append(("Open Folder", self._open_deeper_folder))
+        entries.append((None, None))
+        entries.append(("Not a True Story",
+                        lambda: self._deeper_drop_verdict(item["id"])))
+        PopupMenu(self, event.x_root, event.y_root, entries)
+
+    def _deeper_drop_verdict(self, media_id: int) -> None:
+        """The verdict was wrong - the title leaves the list for good."""
+        self._db.set_true_story(media_id, False, None)
+        self._refresh_deeper_list(force=True)
+        if self._on_changed:
+            self._on_changed([media_id])
+        self._deeper_status.configure(
+            text="Removed the title - a new scan will not flag it again.")
+
     def _on_deeper_select(self, event=None) -> None:
         """Show the story of the selected title - from the cache."""
         selection = self._deeper_tree.selection()
@@ -1820,15 +1867,19 @@ class SettingsView(tk.Frame):
         self._deeper_buttons(True)
         story = self._db.story_cache(item["id"])
         self._show_deeper_story(item, story)
-        if not story:
-            # nothing cached yet - fetch it once, in the background
+        if (not story and not self._deeper_running
+                and str(item.get("true_story_article") or "").strip()):
+            # nothing cached yet - fetch it once, in the background. While the
+            # bulk run is going, its own chunks already cover this row.
             self._fetch_story(item)
 
     def _show_deeper_story(self, item: dict, story: dict) -> None:
         """Fill the reading pane with what is known about the title."""
         blocks: list[tuple[str, str]] = [
             ("title", self._deeper_head(item)),
-            ("body", self._deeper_plot(item)),
+            ("body", self._deeper_plot(item)
+             or (("\n" + str(story.get("movie") or "").strip() + "\n")
+                 if story.get("movie") else "")),
         ]
         if story.get("real"):
             blocks.append(("head", "WHAT REALLY HAPPENED\n"))
@@ -1851,9 +1902,19 @@ class SettingsView(tk.Frame):
         source = story.get("source")
         if source:
             blocks.append(("link", (true_story.article_url(source) or "") + "\n"))
-        if len(blocks) == 2:
-            blocks.append(("body", "\nThe story of this title has not been cached "
-                                  "yet - press Cache the stories.\n"))
+        if len(blocks) == 2 and not story.get("movie"):
+            if story:
+                # cached, but the provider knew nothing about it
+                blocks.append(("body", "\nNothing more is known about the story "
+                                      "of this title.\n"))
+            elif str(item.get("true_story_article") or "").strip():
+                blocks.append(("body", "\nThe story of this title has not been "
+                                      "cached yet - press Cache the stories.\n"))
+            else:
+                # no article to fetch - caching can never fill this in
+                blocks.append(("body", "\nThis title was flagged as a true story, "
+                                      "but no article about it was found, so "
+                                      "there is no story to read here.\n"))
         self._set_deeper_text(*blocks)
 
     def _fetch_story(self, item: dict) -> None:
@@ -1896,8 +1957,12 @@ class SettingsView(tk.Frame):
                 if not self._db.story_cache(i["id"])
                 and str(i.get("true_story_article") or "").strip()]
         if not todo:
+            nf = len([i for i in items if not self._db.story_cache(i["id"])])
             self._deeper_status.configure(
-                text="Every story is cached - it can be read without a network.")
+                text=(f"Every story is cached - it can be read without a network."
+                      if not nf else
+                      f"Nothing left to cache - {nf} title(s) have no article "
+                      f"about their story, so there is nothing to fetch."))
             return
         self._deeper_running = True
         self._deeper_cancel.clear()
@@ -1910,6 +1975,7 @@ class SettingsView(tk.Frame):
 
         def worker() -> None:
             done = 0
+            clock = time.monotonic()
             for start in range(0, len(todo), 20):
                 if self._deeper_cancel.is_set():
                     break
@@ -1924,7 +1990,11 @@ class SettingsView(tk.Frame):
                     if story:
                         self._db.set_story_cache(item["id"], story)
                 done += len(chunk)
-                self._post(lambda d=done: self._deeper_progress.configure(value=d))
+                # wikipedia answers one request at a time, so the elapsed time
+                # is the only honest estimate there is
+                left = (time.monotonic() - clock) / done * (len(todo) - done)
+                self._post(lambda d=done, s=left:
+                           self._deeper_progress_state(d, len(todo), s))
             self._post(lambda: self._stories_cached(done, len(todo)))
 
         threading.Thread(target=self._db.thread_target(worker), daemon=True).start()
@@ -1996,13 +2066,24 @@ class SettingsView(tk.Frame):
         self._deeper_status.configure(
             text=f"Checking {done} of {total} — {title} ({kind}) · {left} to go")
 
+    def _deeper_progress_state(self, done: int, total: int,
+                               seconds_left: float) -> None:
+        """Show how far the story run is, and how much longer it needs."""
+        self._deeper_progress.configure(value=done)
+        if seconds_left < 60:
+            left = f"{max(int(seconds_left), 1)}s left"
+        else:
+            left = f"{int(round(seconds_left / 60))} min left"
+        self._deeper_status.configure(
+            text=f"Caching the story of {done} of {total} title(s) · {left}")
+
     def _deeper_finished(self, done: int, found: int, total: int,
                          stopped: bool, flagged: list[int]) -> None:
         self._deeper_running = False
         self._deeper_scan_btn.configure(state="normal")
         self._deeper_stop_btn.configure(state="disabled")
         self._deeper_progress.pack_forget()
-        self._refresh_deeper_list()
+        self._refresh_deeper_list(force=True)
         if flagged and self._on_changed:
             # the library shows the flag in the details view too
             self._on_changed(flagged)
@@ -2027,7 +2108,7 @@ class SettingsView(tk.Frame):
         ):
             return
         self._db.reset_true_story()
-        self._refresh_deeper_list()
+        self._refresh_deeper_list(force=True)
         self._deeper_status.configure(text="Every flag was forgotten.")
 
     # --- Wikiquote tab --------------------------------------------------

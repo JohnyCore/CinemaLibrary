@@ -100,11 +100,25 @@ CREATE INDEX IF NOT EXISTS idx_episodes_watched ON episodes(watched, last_watche
 CREATE INDEX IF NOT EXISTS idx_media_collection ON media(collection_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_episodes_row
     ON episodes(series_id, season, episode, path);
+CREATE INDEX IF NOT EXISTS idx_media_true_story ON media(true_story);
 """
 
 # the folder an item is filed in comes along with the item
 _SELECT_MEDIA = """
 SELECT m.*, c.name AS collection_name FROM media m
+LEFT JOIN collections c ON c.id = m.collection_id
+"""
+
+# the whole library is held in memory - the story blob is only read by the
+# one pane that re-queries its row, so it stays out of the list query
+_SELECT_MEDIA_LIST = """
+SELECT m.id, m.path, m.title, m.media_type, m.year, m.root, m.video_path,
+       m.poster_path, m.poster2_path, m.mtime, m.imdb_id, m.plot, m.genres,
+       m.rating, m.runtime, m.director, m.writer, m.cast_list, m.country,
+       m.release_date, m.watched, m.last_watched, m.added_at, m.last_scanned,
+       m.collection_id, m.true_story, m.true_story_article, m.my_rating,
+       m.quotes, m.from_provider, c.name AS collection_name
+FROM media m
 LEFT JOIN collections c ON c.id = m.collection_id
 """
 
@@ -331,7 +345,7 @@ class Database:
             self.conn.execute("DROP TABLE episodes_old")
 
     def load_all(self) -> list[dict]:
-        rows = self.conn.execute(_SELECT_MEDIA).fetchall()
+        rows = self.conn.execute(_SELECT_MEDIA_LIST).fetchall()
         items = [dict(r) for r in rows]
         stats = self.episode_stats()
         for item in items:
@@ -758,12 +772,22 @@ class Database:
                        article: str | None = None) -> None:
         """Flag an item as based on a true story (None = not known yet).
 
-        `article` is the Wikipedia article the verdict came from.
+        `article` is the Wikipedia article the verdict came from. A different
+        article means a different story: the cached one belongs to the old
+        article and is dropped, so it is fetched again.
         """
+        new_article = str(article or "").strip() or None
         with self.conn:
+            row = self.conn.execute(
+                "SELECT true_story_article FROM media WHERE id=?", (media_id,)
+            ).fetchone()
+            old_article = (row["true_story_article"] if row else None) or None
             self.conn.execute(
-                "UPDATE media SET true_story=?, true_story_article=? WHERE id=?",
-                (None if value is None else (1 if value else 0), article, media_id),
+                "UPDATE media SET true_story=?, true_story_article=?, "
+                "story_cache=CASE WHEN ? THEN NULL ELSE story_cache END "
+                "WHERE id=?",
+                (None if value is None else (1 if value else 0), new_article,
+                 old_article != new_article, media_id),
             )
 
     def true_story_items(self) -> list[dict]:
@@ -776,11 +800,18 @@ class Database:
         return [dict(r) for r in rows]
 
     def set_story_cache(self, media_id: int, story: dict) -> None:
-        """Store the whole story of a film, so it can be read offline."""
+        """Store the whole story of a film, so it can be read offline.
+
+        Empty fields are dropped: a record of nothing but `None` would count
+        as cached while there is nothing to read.
+        """
+        story = {k: v for k, v in (story or {}).items()
+                 if v not in (None, "", [], {})}
         with self.conn:
             self.conn.execute(
                 "UPDATE media SET story_cache=? WHERE id=?",
-                (json.dumps(story, ensure_ascii=False), media_id))
+                (json.dumps(story, ensure_ascii=False) if story else None,
+                 media_id))
 
     def story_cache(self, media_id: int) -> dict:
         """The cached story of a film (empty when there is none)."""
@@ -1299,6 +1330,7 @@ class Database:
             return value
 
         title = data.get("title")
+        new_imdb = str(data.get("imdb_id") or "").strip()
         params = (
             enc(title), data.get("year"), data.get("imdb_id"),
             data.get("plot"), enc(data.get("genres")), data.get("rating"),
@@ -1308,6 +1340,8 @@ class Database:
             enc(title), media_id,
         )
         with self.conn:
+            old = self.conn.execute(
+                "SELECT imdb_id FROM media WHERE id=?", (media_id,)).fetchone()
             self.conn.execute(
                 "UPDATE media SET "
                 "title=COALESCE(?, title), year=COALESCE(?, year), "
@@ -1322,6 +1356,10 @@ class Database:
                 "WHERE id=?",
                 params,
             )
+            # a new identity means the old story was another film's story
+            if new_imdb and (old["imdb_id"] or "") != new_imdb:
+                self.conn.execute(
+                    "UPDATE media SET story_cache=NULL WHERE id=?", (media_id,))
 
     def set_episode_names(self, media_id: int,
                           seasons: dict[int, list[dict]]) -> None:

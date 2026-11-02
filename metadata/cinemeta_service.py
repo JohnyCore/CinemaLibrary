@@ -17,6 +17,9 @@ _TIMEOUT = 20
 _USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) CinemaLibrary"
 # how long to wait before the n-th retry of a 429 / 5xx answer
 _BACKOFF = (0.8, 2.0, 4.0)
+# and the whole attempt budget: a dead network must not pin a worker on one
+# item for a minute - a bulk fetch would never finish
+_BUDGET = 25.0
 
 _TYPE_MAP = {"movie": "movie", "series": "series", "tv": "series"}
 
@@ -59,7 +62,10 @@ def _get_json(url: str) -> dict:
     host = parts.hostname or "v3-cinemeta.strem.io"
     path = parts.path + (("?" + parts.query) if parts.query else "")
     last: Exception | None = None
+    deadline = time.monotonic() + _BUDGET
     for attempt in range(len(_BACKOFF) + 1):
+        if attempt and time.monotonic() >= deadline:
+            break
         try:
             conn = _connection(host)
             conn.request("GET", path, headers={

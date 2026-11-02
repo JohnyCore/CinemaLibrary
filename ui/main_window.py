@@ -174,6 +174,7 @@ class MainWindow(tk.Frame):
         self._movies_dir = movies_dir
         self._series_dir = series_dir
         self._q: "queue.Queue[Callable[[], None]]" = queue.Queue()
+        self._drain_job: str | None = None
         self._images = ImageCache(config.THUMB_CACHE_DIR, self._post,
                                   config.PLACEHOLDER_PATH)
         self._scan_running = False
@@ -202,7 +203,10 @@ class MainWindow(tk.Frame):
         self._show_library()
 
         self._load_from_db()
-        root.after(16, self._drain)
+        # a posted callback wakes the main thread at once; the slow poll is
+        # only there in case a wake-up event was lost
+        root.bind("<<Posted>>", lambda _event=None: self._drain())
+        self._drain_job = root.after(1000, self._drain)
         root.bind("<Escape>", self._escape)
         root.after(300, self._rescan_clicked)
 
@@ -392,8 +396,20 @@ class MainWindow(tk.Frame):
     def _post(self, fn: Callable[[], None]) -> None:
         """Queue a callback for the main thread without touching Tk from a worker."""
         self._q.put(fn)
+        try:
+            # an event, not a poll: an idle app must not wake up 60 times a
+            # second just to look at an empty queue
+            self.root.event_generate("<<Posted>>", when="tail")
+        except (tk.TclError, RuntimeError):
+            pass  # the window is gone - the slow poll finds nothing either
 
     def _drain(self) -> None:
+        if self._drain_job is not None:
+            try:
+                self.after_cancel(self._drain_job)
+            except tk.TclError:
+                pass
+            self._drain_job = None
         for _ in range(300):
             try:
                 fn = self._q.get_nowait()
@@ -405,10 +421,7 @@ class MainWindow(tk.Frame):
                 log.exception("queued callback failed")
         if self._closing:
             return
-        if not self._q.empty():
-            self.after_idle(self._drain)
-        else:
-            self.after(16, self._drain)
+        self._drain_job = self.after(1000 if self._q.empty() else 16, self._drain)
 
     def _tick(self) -> None:
         """Refresh the background-work counters."""
@@ -698,7 +711,7 @@ class MainWindow(tk.Frame):
             try:
                 self.after_cancel(self._search_job)
             except Exception:
-                pass
+                log.debug("could not cancel the search job", exc_info=True)
         self._search_job = self.after(250, self._flush_search)
 
     def _flush_search(self) -> None:
@@ -1338,6 +1351,9 @@ class MainWindow(tk.Frame):
         # Pack settings - this will be drawn on next frame
         self._settings.pack(fill="both", expand=True)
         self._settings_btn.configure(fg=TEXT, bg="#1a2130")
+        # the tabs keep their rows between visits - a scan may have changed
+        # them since, so they are re-read once on the way in
+        self._settings.refresh_cached_lists()
 
     def _on_settings_saved(self) -> None:
         # the new folders live in config; pick them up before rescanning
