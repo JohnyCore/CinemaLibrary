@@ -19,6 +19,7 @@ BORDER = "#242a35"
 TEXT = "#e8eaed"
 MUTED = "#9aa4b2"
 ACCENT = "#e5484d"
+HOVER_OUTLINE = "#596575"
 
 CARD_W = 158
 CARD_H = 300
@@ -45,6 +46,15 @@ def calculate_grid_layout(width: int) -> tuple[int, int]:
 def should_ignore_click_after_resize(resized_at: float | None, now: float) -> bool:
     """Ignore clicks that can leak through a native maximize/restore action."""
     return resized_at is not None and 0 <= now - resized_at < 0.5
+
+
+def badge_tooltip_text(item: dict, badge: str) -> str | None:
+    """Describe the information represented by a card badge."""
+    if badge == "rating" and item.get("my_rating") is not None:
+        return f"Your rating: {item['my_rating']}/5"
+    if badge == "watched" and item.get("seen"):
+        return "Marked as watched"
+    return None
 
 
 class LibraryView(tk.Frame):
@@ -99,6 +109,7 @@ class LibraryView(tk.Frame):
             "<Configure>", self._on_toplevel_configure, add="+",
         )
         self._focus_idx: int | None = None
+        self._hover_idx: int | None = None
         self._title_font = tkfont.Font(family="Segoe UI Semibold", size=10)
         self._meta_font = tkfont.Font(family="Segoe UI", size=8)
         self._watched_icon_font = icon_font(8)
@@ -107,6 +118,9 @@ class LibraryView(tk.Frame):
         self._rating_icon = icon_glyph("star")
         self._rating_font = tkfont.Font(family="Segoe UI Semibold", size=8)
         self._fit_cache: dict[str, str] = {}
+        self._tooltip_job: str | None = None
+        self._tooltip_window: tk.Toplevel | None = None
+        self._tooltip_text: str | None = None
 
         self._profile_panel = tk.Frame(
             self, bg="#12161d", width=360, highlightthickness=1,
@@ -179,6 +193,7 @@ class LibraryView(tk.Frame):
         self.canvas.bind("<Button-1>", self._on_click)
         self.canvas.bind("<Button-3>", self._on_right_click)
         self.canvas.bind("<Motion>", self._on_motion)
+        self.canvas.bind("<Leave>", self._on_leave)
         self.canvas.bind("<Key>", self._on_key)
         self.canvas.bind("<Control-a>", self._on_select_all)
         # the wheel handler is global, but it is only this view's: it is
@@ -204,6 +219,7 @@ class LibraryView(tk.Frame):
             unbind_bindall(self, "<MouseWheel>", getattr(self, "_wheel_id", None))
         except Exception:
             log.debug("could not drop the wheel binding", exc_info=True)
+        self._hide_tooltip()
         if self._window_configure_id:
             try:
                 self._toplevel.unbind("<Configure>", self._window_configure_id)
@@ -233,6 +249,8 @@ class LibraryView(tk.Frame):
             previous = self._items[self._focus_idx]
         self._items = items
         self._focus_idx = None
+        self._hover_idx = None
+        self._hide_tooltip()
         # the items that are still there stay marked
         self._selected &= {i.get("id") for i in items}
         if previous is not None:
@@ -355,16 +373,24 @@ class LibraryView(tk.Frame):
         selected = item is not None and item.get("id") in self._selected
         if focused or selected:
             return ACCENT
+        if self._hover_idx is not None and pos == self._pos_of(self._hover_idx):
+            return HOVER_OUTLINE
         return BORDER
+
+    def _paint_card_state(self, pos: tuple[int, int]) -> None:
+        ids = self._rendered.get(pos)
+        if not ids:
+            return
+        emphasized = self._outline_for(pos) != BORDER
+        self.canvas.itemconfig(
+            ids[0], outline=self._outline_for(pos), width=2 if emphasized else 1,
+        )
 
     def _paint_selection(self) -> None:
         """Show which cards are marked."""
         for pos in list(self._rendered):
-            ids = self._rendered.get(pos)
-            if not ids:
-                continue
             try:
-                self.canvas.itemconfig(ids[0], outline=self._outline_for(pos))
+                self._paint_card_state(pos)
             except tk.TclError:
                 log.debug("card %s is gone - its outline is skipped", pos)
 
@@ -390,6 +416,7 @@ class LibraryView(tk.Frame):
         poster_height = round(poster_width * POSTER_H / POSTER_W)
         card_height = poster_height + CARD_H - POSTER_H
         if (cols, card_width) != (self._cols, self._card_w):
+            self._clear_hover()
             self._cols = cols
             self._card_w = card_width
             self._poster_w = poster_width
@@ -422,6 +449,7 @@ class LibraryView(tk.Frame):
     def set_empty(self, message: str, button: str | None = None,
                   command=None) -> None:
         """What the grid shows when it is empty."""
+        self._clear_hover()
         self._empty_message = message
         self._empty_button = button
         self._empty_command = command
@@ -433,6 +461,7 @@ class LibraryView(tk.Frame):
     # --- scrolling ----------------------------------------------------
 
     def _on_vsb(self, *args) -> None:
+        self._clear_hover()
         self.canvas.yview(*args)
         self.after_idle(self._sync_cells)
 
@@ -444,6 +473,7 @@ class LibraryView(tk.Frame):
             widget = widget.master
         if widget is not self:
             return
+        self._clear_hover()
         px = int(round(-event.delta * 0.4))
         if px == 0 and event.delta:
             px = -1 if event.delta > 0 else 1
@@ -453,12 +483,16 @@ class LibraryView(tk.Frame):
     # --- mouse --------------------------------------------------------
 
     def _item_at(self, event) -> dict | None:
+        index = self._index_at()
+        return self._items[index] if index is not None else None
+
+    def _index_at(self) -> int | None:
         for item in self.canvas.find_withtag("current"):
             for tag in self.canvas.gettags(item):
                 if tag.startswith("c:"):
                     idx = int(tag[2:])
                     if 0 <= idx < len(self._items):
-                        return self._items[idx]
+                        return idx
         return None
 
     def _on_click(self, event) -> None:
@@ -466,6 +500,7 @@ class LibraryView(tk.Frame):
         item = self._item_at(event)
         if item is None:
             return
+        self._clear_hover()
         if should_ignore_click_after_resize(
             self._window_resized_at, time.monotonic(),
         ):
@@ -499,6 +534,7 @@ class LibraryView(tk.Frame):
         item = self._item_at(event)
         if item is None or self._on_context is None:
             return
+        self._clear_hover()
         if item.get("id") not in self._selected:
             # a right click outside the selection works on that item alone
             self._selected = {item.get("id")}
@@ -507,10 +543,78 @@ class LibraryView(tk.Frame):
         self._on_context(item, event.x_root, event.y_root)
 
     def _on_motion(self, event=None) -> None:
-        # the whole grid is clickable, so the pointer is always a hand and no
-        # per-motion hit test is needed
         if self.canvas["cursor"] != ("hand2" if self._items else ""):
             self.canvas.configure(cursor="hand2" if self._items else "")
+        index = self._index_at() if event is not None else None
+        if index != self._hover_idx:
+            previous = self._hover_idx
+            self._hover_idx = index
+            for candidate in (previous, index):
+                if candidate is not None:
+                    self._paint_card_state(self._pos_of(candidate))
+        self._schedule_tooltip(self._current_badge_tooltip())
+
+    def _on_leave(self, _event=None) -> None:
+        self._clear_hover()
+
+    def _clear_hover(self) -> None:
+        previous = self._hover_idx
+        self._hover_idx = None
+        if previous is not None:
+            self._paint_card_state(self._pos_of(previous))
+        self._schedule_tooltip(None)
+
+    def _current_badge_tooltip(self) -> str | None:
+        index = self._index_at()
+        if index is None:
+            return None
+        for iid in self.canvas.find_withtag("current"):
+            tags = self.canvas.gettags(iid)
+            for badge in ("rating", "watched"):
+                if f"badge:{badge}" in tags:
+                    return badge_tooltip_text(self._items[index], badge)
+        return None
+
+    def _schedule_tooltip(self, text: str | None) -> None:
+        if text == self._tooltip_text:
+            return
+        self._hide_tooltip()
+        if text is not None:
+            self._tooltip_text = text
+            self._tooltip_job = self.after(
+                500, lambda: self._show_tooltip(text),
+            )
+
+    def _show_tooltip(self, text: str) -> None:
+        self._tooltip_job = None
+        if text != self._tooltip_text:
+            return
+        window = tk.Toplevel(self)
+        window.wm_overrideredirect(True)
+        window.attributes("-topmost", True)
+        tk.Label(
+            window, text=text, bg="#202833", fg=TEXT,
+            font=("Segoe UI", 9), padx=8, pady=4,
+        ).pack()
+        window.wm_geometry(
+            f"+{self.winfo_pointerx() + 12}+{self.winfo_pointery() + 18}"
+        )
+        self._tooltip_window = window
+
+    def _hide_tooltip(self) -> None:
+        if self._tooltip_job is not None:
+            try:
+                self.after_cancel(self._tooltip_job)
+            except tk.TclError:
+                log.debug("could not cancel card tooltip", exc_info=True)
+            self._tooltip_job = None
+        if self._tooltip_window is not None:
+            try:
+                self._tooltip_window.destroy()
+            except tk.TclError:
+                log.debug("card tooltip window is already gone")
+            self._tooltip_window = None
+        self._tooltip_text = None
 
     # --- keyboard -----------------------------------------------------
 
@@ -544,9 +648,10 @@ class LibraryView(tk.Frame):
             ids = self._rendered.get(pos)
             if not ids:
                 continue
-            self.canvas.itemconfig(ids[0], outline=self._outline_for(pos))
+            self._paint_card_state(pos)
 
     def _scroll_into_view(self, index: int) -> None:
+        self._clear_hover()
         row = index // self._cols
         top = self.canvas.canvasy(0)
         height = self.canvas.winfo_height() or 600
@@ -674,7 +779,7 @@ class LibraryView(tk.Frame):
         ids.append(self.canvas.create_text(
             (x0 + x1) // 2, y0 + self._poster_h + 7, text=title, anchor="n",
             width=self._text_width, justify="center", fill=TEXT, font=self._title_font,
-            tags=tag,
+            tags=(tag, "card-title"),
         ))
         year = item.get("year")
         kind = "Series" if item.get("media_type") == "series" else "Movie"
@@ -683,33 +788,38 @@ class LibraryView(tk.Frame):
         meta = "  ·  ".join(parts)
         ids.append(self.canvas.create_text(
             (x0 + x1) // 2, y1 - 9, text=meta, anchor="s", fill=MUTED,
-            font=self._meta_font, tags=tag,
+            font=self._meta_font, tags=(tag, "card-meta"),
         ))
         if rating is not None:
             badge_x = x0 + 27
             badge_y = y0 + 20
             ids.append(self.canvas.create_oval(
                 badge_x - 20, badge_y - 11, badge_x + 20, badge_y + 11,
-                fill="#171914", outline="#51472d", width=1, tags=tag,
+                fill="#171914", outline="#51472d", width=1,
+                tags=(tag, "badge:rating"),
             ))
             ids.append(self.canvas.create_text(
                 badge_x - 7, badge_y, text=self._rating_icon, anchor="center",
-                fill="#ffd166", font=self._rating_icon_font, tags=tag,
+                fill="#ffd166", font=self._rating_icon_font,
+                tags=(tag, "badge:rating"),
             ))
             ids.append(self.canvas.create_text(
                 badge_x + 6, badge_y, text=str(rating), anchor="center",
-                fill="#f2e9d2", font=self._rating_font, tags=tag,
+                fill="#f2e9d2", font=self._rating_font,
+                tags=(tag, "badge:rating"),
             ))
         if item.get("seen"):
             badge_x = x1 - 20
             badge_y = y0 + 20
             ids.append(self.canvas.create_oval(
                 badge_x - 10, badge_y - 10, badge_x + 10, badge_y + 10,
-                fill="#101a19", outline="#38574d", width=1, tags=tag,
+                fill="#101a19", outline="#38574d", width=1,
+                tags=(tag, "badge:watched"),
             ))
             ids.append(self.canvas.create_text(
                 badge_x, badge_y, text=self._watched_icon, anchor="center",
-                fill="#77e0b0", font=self._watched_icon_font, tags=tag,
+                fill="#77e0b0", font=self._watched_icon_font,
+                tags=(tag, "badge:watched"),
             ))
         self._rendered[pos] = ids
         self._rendered_items[pos] = item

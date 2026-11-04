@@ -958,6 +958,29 @@ def ui_checks(target: Path) -> None:
                   "Scan finished" in app._status_left.cget("text"))
             check("rescan button is usable again",
                   str(app._rescan_btn.cget("state")) == "normal")
+            original_stats = app._images.stats
+            app._images.stats = {"active": 0, "queued": 0}
+            app._tick()
+            check("thumbnail status is hidden while idle",
+                  not app._status_right.winfo_manager())
+            app._images.stats["active"] = 2
+            app._tick()
+            check("thumbnail status appears while work is active",
+                  app._status_right.winfo_manager() == "pack"
+                  and "2 active" in app._status_right.cget("text"))
+            app._images.stats.update(active=0, queued=0)
+            app._tick()
+            check("thumbnail status hides again after work",
+                  not app._status_right.winfo_manager())
+            app._images.stats = original_stats
+            insights_children = tuple(app._insights.winfo_children())
+            app._set_section("insights")
+            root.update()
+            check("switching to Insights reuses its existing view",
+                  bool(insights_children)
+                  and tuple(app._insights.winfo_children()) == insights_children)
+            app._set_section("all")
+            root.update()
             app._sort.focus_force()
             app._sort.current(1)
             app._sort.selection_range(0, "end")
@@ -1231,6 +1254,88 @@ def ui_checks(target: Path) -> None:
                 lib.canvas.yview_scroll(55, "units")
             lib.canvas.update()
             check("grid created visible cards", 0 < len(lib._rendered) <= 60)
+            original_grid_view = lib.canvas.yview()
+            lib.canvas.yview_moveto(0.0)
+            lib._sync_cells()
+            root.update()
+            card_pos, card_ids = next(iter(lib._rendered.items()))
+            title_id = next(
+                (iid for iid in card_ids if "card-title" in lib.canvas.gettags(iid)),
+                None,
+            )
+            meta_id = next(
+                (iid for iid in card_ids if "card-meta" in lib.canvas.gettags(iid)),
+                None,
+            )
+            check("card title keeps its original footer style",
+                  title_id is not None and lib._title_font.cget("size") == 10)
+            check("card metadata keeps its original subdued style",
+                  meta_id is not None and lib._meta_font.cget("size") == 8
+                  and lib.canvas.itemcget(meta_id, "fill") == "#9aa4b2")
+            rect_id = card_ids[0]
+            rect = lib.canvas.coords(rect_id)
+            lib.canvas.event_generate(
+                "<Motion>",
+                x=round((rect[0] + rect[2]) / 2 - lib.canvas.canvasx(0)),
+                y=round((rect[1] + rect[3]) / 2 - lib.canvas.canvasy(0)),
+            )
+            root.update()
+            check("hovered card has a distinct outline",
+                  lib.canvas.itemcget(rect_id, "outline") == "#596575"
+                  and lib.canvas.itemcget(rect_id, "width") == "2.0")
+            lib.canvas.event_generate("<Leave>")
+            root.update()
+            check("hover outline clears when the pointer leaves",
+                  lib.canvas.itemcget(rect_id, "outline") == "#242a35"
+                  and lib.canvas.itemcget(rect_id, "width") == "1.0")
+            from ui import library_view
+            check("rating badge tooltip explains its meaning",
+                  library_view.badge_tooltip_text({"my_rating": 4}, "rating")
+                  == "Your rating: 4/5")
+            check("watched badge tooltip explains its meaning",
+                  library_view.badge_tooltip_text({"seen": True}, "watched")
+                  == "Marked as watched")
+            original_items = lib._items
+            probe_index = card_pos[0] * lib._cols + card_pos[1]
+            probe_items = list(original_items)
+            probe_item = dict(probe_items[probe_index])
+            probe_item.update(my_rating=4, seen=True)
+            probe_items[probe_index] = probe_item
+            lib.show_items(probe_items)
+            root.update()
+            for badge_kind, expected in (
+                ("rating", "Your rating: 4/5"),
+                ("watched", "Marked as watched"),
+            ):
+                badge_id = next(
+                    (iid for iid in lib._rendered.get(card_pos, [])
+                     if f"badge:{badge_kind}" in lib.canvas.gettags(iid)),
+                    None,
+                )
+                if badge_id is not None:
+                    badge_box = lib.canvas.coords(badge_id)
+                    lib.canvas.event_generate(
+                        "<Motion>",
+                        x=round((badge_box[0] + badge_box[2]) / 2
+                                - lib.canvas.canvasx(0)),
+                        y=round((badge_box[1] + badge_box[3]) / 2
+                                - lib.canvas.canvasy(0)),
+                    )
+                    root.update()
+                check(f"{badge_kind} badge displays its tooltip",
+                      badge_id is not None
+                      and pump_until(
+                          lambda: lib._tooltip_window is not None,
+                          timeout=1.0,
+                      )
+                      and lib._tooltip_window.winfo_children()[0].cget("text")
+                      == expected)
+            lib.canvas.event_generate("<Leave>")
+            root.update()
+            lib.show_items(original_items)
+            lib.canvas.yview_moveto(original_grid_view[0])
+            lib._sync_cells()
+            root.update()
             # a card draws between 3 and 9 primitives (badges are optional),
             # so the canvas must hold exactly the items the view remembers
             drawn = sum(len(ids) for ids in lib._rendered.values())

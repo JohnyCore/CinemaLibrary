@@ -450,9 +450,6 @@ class MainWindow(tk.Frame):
                                               style="Dark.Horizontal.TProgressbar")
         self._status_right = tk.Label(status, bg=TOPBAR_BG, fg=MUTED,
                                       font=("Segoe UI", 9), anchor="e")
-        self._status_right.pack(side="right", padx=14)
-        self._status_active = -1
-        self._status_queued = -1
         self.root.after(1000, self._tick)
 
     # --- main thread plumbing -----------------------------------------
@@ -494,11 +491,13 @@ class MainWindow(tk.Frame):
         stats = self._images.stats
         active = stats["active"]
         queued = max(stats["queued"], 0)
-        if active != self._status_active or queued != self._status_queued:
-            self._status_active = active
-            self._status_queued = queued
+        if active or queued:
             self._status_right.configure(
-                text=f"thumbs: {active} active · {queued} queued")
+                text=f"Thumbnails · {active} active · {queued} queued")
+            if not self._status_right.winfo_manager():
+                self._status_right.pack(side="right", padx=14)
+        elif self._status_right.winfo_manager():
+            self._status_right.pack_forget()
         self.after(1000, self._tick)
 
     # --- data ---------------------------------------------------------
@@ -778,7 +777,6 @@ class MainWindow(tk.Frame):
         if section == "insights":
             self._library.pack_forget()
             self._insights.pack(fill="both", expand=True)
-            self._render_insights()
             return
         if not self._library.winfo_ismapped():
             self._show_library()
