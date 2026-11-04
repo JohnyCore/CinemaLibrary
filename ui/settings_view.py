@@ -125,6 +125,8 @@ class SettingsView(tk.Frame):
             self._tab_buttons[key] = btn
         self._tab_indicator = tk.Frame(self._tab_strip, bg=ACCENT, height=2,
                                         highlightthickness=0, bd=0)
+        self._tab_strip.bind("<Configure>", self._on_tab_geometry)
+        self._tab_strip.bind("<Map>", self._on_tab_geometry)
 
         # Tab content area
         self._tab_body = tk.Frame(self, bg=PANEL_BG, highlightthickness=0, bd=0)
@@ -237,6 +239,10 @@ class SettingsView(tk.Frame):
             width=btn.winfo_width(), height=2,
         )
 
+    def _on_tab_geometry(self, _event=None) -> None:
+        """Reposition the active underline after the tab strip is laid out."""
+        self.after_idle(self._place_tab_indicator)
+
     @staticmethod
     def _page_intro(parent: tk.Frame, title: str, description: str) -> None:
         """Give each settings tool a shared title and concise explanation."""
@@ -313,7 +319,6 @@ class SettingsView(tk.Frame):
         current = config.load_settings()
         self._movies_var = tk.StringVar(value=str(current.get("movies_dir", "")))
         self._series_var = tk.StringVar(value=str(current.get("series_dir", "")))
-        self._organizer_var = tk.StringVar(value=str(current.get("organizer_dir", "")))
 
         primary_row = tk.Frame(inner, bg=PANEL_BG)
         primary_row.pack(fill="x")
@@ -326,7 +331,6 @@ class SettingsView(tk.Frame):
         )
         self._folder_row(folders, "Movies", self._movies_var)
         self._folder_row(folders, "TV series", self._series_var)
-        self._folder_row(folders, "Organizer destination", self._organizer_var)
         save_row = tk.Frame(folders, bg="#0f1319")
         save_row.pack(fill="x", pady=(2, 0))
         tk.Label(
@@ -570,7 +574,6 @@ class SettingsView(tk.Frame):
         folders = {
             "movies_dir": self._movies_var.get().strip(),
             "series_dir": self._series_var.get().strip(),
-            "organizer_dir": self._organizer_var.get().strip(),
         }
         for label, path in folders.items():
             if path and not Path(path).is_dir():
@@ -636,7 +639,6 @@ class SettingsView(tk.Frame):
             settings = config.load_settings()
             self._movies_var.set(settings.get("movies_dir", ""))
             self._series_var.set(settings.get("series_dir", ""))
-            self._organizer_var.set(settings.get("organizer_dir", ""))
             self._refresh_players()
             self._on_saved()
             self.after(2000, lambda: self._status.configure(fg=MUTED))

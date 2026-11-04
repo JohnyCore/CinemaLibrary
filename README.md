@@ -58,6 +58,8 @@ the app with these tabs:
 * **Dig Deeper** — the movies and series whose story is based on a true
   story, with a two-pane story reader.
 * **Wikiquote** — browse films and read their quotes side by side.
+* **Watched Elsewhere** — search the metadata provider and keep a separate
+  offline record of titles you watched without a local file.
 * **Library Health** — review missing files, duplicates, and index issues,
   with tools to inspect and repair the library.
 
@@ -86,6 +88,19 @@ settings before replacing anything, and saves a safety copy of the current
 database and settings alongside the originals. **Export CSV** writes the
 current movie and series list. **Open Data Folder** opens Cinema's local data
 directory in the system file explorer.
+
+### Watched Elsewhere
+
+Search the connected metadata provider, open a result in the regular details
+view, and choose **Save to Watched Elsewhere**. The saved title has its own
+watched state and its provider metadata and artwork remain in `data/` for
+offline reading. These records are separate from local-file titles: library
+rescans and local metadata edits do not change them. If a likely local copy is
+found, Cinema suggests opening it; the two records are never merged
+automatically. From the saved titles list, you can change the watched status or
+remove a title along with its cached artwork.
+Personal ratings for saved titles are stored separately from local titles and
+do not navigate away from the details view.
 
 ## What it detects
 

@@ -54,6 +54,7 @@ _CODE = {
     "refresh": "f021",
     "download": "f019",
     "eye": "f06e",
+    "eye-slash": "f070",
     "calendar": "f133",
     "clock": "f017",
     "trash": "f1f8",      # trash-can

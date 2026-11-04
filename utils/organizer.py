@@ -174,6 +174,80 @@ def move_entry(entry: PlanEntry, root: Path) -> str:
     return entry.result
 
 
+def transfer_organized_folders(
+    folders: list[tuple[str, Path]],
+    movies_dir: Path | None,
+    series_dir: Path | None,
+) -> tuple[list[tuple[Path, Path]], list[str]]:
+    """Move organized title folders to their configured library roots.
+
+    Existing destination folders are never merged or overwritten. A folder
+    already at its intended destination is left in place.
+    """
+    moved: list[tuple[Path, Path]] = []
+    problems: list[str] = []
+    seen: set[tuple[str, Path]] = set()
+    destinations = {"movie": movies_dir, "series": series_dir}
+
+    for kind, source in folders:
+        key = (kind, source)
+        if key in seen:
+            continue
+        seen.add(key)
+        root = destinations.get(kind)
+        if root is None:
+            problems.append(f"{source.name}: no {kind} library folder is configured")
+            continue
+        destination = root / source.name
+        try:
+            source_resolved = source.resolve()
+            destination_resolved = destination.resolve()
+            if source_resolved == destination_resolved:
+                problems.append(f"{source.name}: already in its library folder")
+                continue
+            if source_resolved in destination_resolved.parents:
+                problems.append(f"{source.name}: destination is inside its source folder")
+                continue
+            if not source.is_dir():
+                problems.append(f"{source.name}: source folder no longer exists")
+                continue
+            if destination.exists():
+                problems.append(f"{source.name}: destination already exists")
+                continue
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(source), str(destination))
+            moved.append((source, destination))
+        except OSError as exc:
+            log.exception("could not transfer organized folder %s", source)
+            problems.append(f"{source.name}: {exc}")
+
+    return moved, problems
+
+
+def restore_transferred_folders(
+    moves: list[tuple[Path, Path]],
+) -> tuple[list[tuple[Path, Path]], list[str]]:
+    """Move transferred folders back to their organizer locations."""
+    restored: list[tuple[Path, Path]] = []
+    problems: list[str] = []
+    for source, destination in reversed(moves):
+        try:
+            if not destination.is_dir():
+                problems.append(f"{destination.name}: transferred folder is missing")
+                continue
+            if source.exists():
+                problems.append(f"{source.name}: organizer folder already exists")
+                continue
+            source.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(destination), str(source))
+            restored.append((source, destination))
+        except OSError as exc:
+            log.exception("could not restore transferred folder %s", destination)
+            problems.append(f"{destination.name}: {exc}")
+
+    return restored, problems
+
+
 def drop_empty(folder: Path, keep: Path) -> None:
     """Remove a folder that holds nothing - the source folder stays."""
     try:

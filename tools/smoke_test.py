@@ -7,6 +7,7 @@ Run from the cinema folder:
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import sqlite3
 import shutil
 import sys
@@ -14,6 +15,7 @@ import tempfile
 import threading
 import time
 import tkinter as tk
+import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -22,6 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import config  # noqa: E402
 from database.db_manager import Database  # noqa: E402
 from metadata import metadata_service  # noqa: E402
+from metadata.cinemeta_service import _to_result  # noqa: E402
 from scanner.library_scanner import scan  # noqa: E402
 from tools.make_test_library import build  # noqa: E402
 from utils import image_utils, title_parser as tp  # noqa: E402
@@ -94,6 +97,88 @@ def check(label: str, cond: bool) -> None:
         failures += 1
 
 
+def artwork_boundary_checks() -> None:
+    from email.message import Message
+    from io import BytesIO
+    import socket
+    from unittest.mock import patch
+    from urllib.request import Request
+
+    from PIL import Image
+
+    import ui.main_window as main_window
+
+    check("provider artwork accepts only allowlisted HTTPS URLs",
+          main_window._validated_cinemeta_art_url(
+              "https://images.metahub.space/poster/tt0000001")
+          is not None
+          and all(main_window._validated_cinemeta_art_url(url) is None for url in (
+              "http://images.metahub.space/poster/tt0000001",
+              "https://example.com/image.jpg",
+              "https://user@images.metahub.space/image.jpg",
+              "https://images.metahub.space:8443/image.jpg",
+          )))
+    public_ip_check = getattr(main_window, "_are_public_art_addresses", None)
+    check("provider artwork rejects private or reserved DNS addresses",
+          callable(public_ip_check)
+          and public_ip_check(["8.8.8.8"])
+          and not public_ip_check(["127.0.0.1"])
+          and not public_ip_check(["169.254.169.254"])
+          and not public_ip_check(["::1"])
+          and not public_ip_check([]))
+    redirect = main_window._CinemetaRedirectHandler().redirect_request(
+        Request("https://images.metahub.space/poster/tt0000001"),
+        None, 302, "Found", Message(),
+        "https://images.metahub.space/poster/tt0000001/redirected",
+    )
+    check("provider artwork requests do not follow redirects", redirect is None)
+
+    image_buffer = BytesIO()
+    Image.new("RGB", (2, 2), "red").save(image_buffer, format="PNG")
+    image_data = image_buffer.getvalue()
+
+    class FakeResponse:
+        headers = {"Content-Length": str(len(image_data))}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def geturl(self):
+            return "https://images.metahub.space/poster/tt0000001"
+
+        def read(self, _limit):
+            return image_data
+
+    class FakeOpener:
+        def open(self, _request, timeout):
+            return FakeResponse()
+
+    public_dns = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.8.8", 443))]
+    local_dns = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 443))]
+    with tempfile.TemporaryDirectory() as directory:
+        target = Path(directory) / "poster.jpg"
+        with patch.object(main_window.socket, "getaddrinfo", return_value=public_dns):
+            with patch.object(main_window, "build_opener", return_value=FakeOpener()):
+                cached = main_window.MainWindow._cache_one_artwork(
+                    "https://images.metahub.space/poster/tt0000001", target)
+        with Image.open(target) as cached_image:
+            is_jpeg = cached_image.format == "JPEG"
+        check("provider artwork is safely cached as an offline image",
+              cached == str(target) and is_jpeg)
+
+    with tempfile.TemporaryDirectory() as directory:
+        target = Path(directory) / "poster.jpg"
+        with patch.object(main_window.socket, "getaddrinfo", return_value=local_dns):
+            with patch.object(main_window, "build_opener", return_value=FakeOpener()):
+                cached = main_window.MainWindow._cache_one_artwork(
+                    "https://images.metahub.space/poster/tt0000001", target)
+        check("provider artwork is not fetched from a private DNS destination",
+              cached is None and not target.exists())
+
+
 def parse_checks() -> None:
     title, year = tp.parse_title_and_year("Inception (2010)")
     check("parse_title_and_year", title == "Inception" and year == 2010)
@@ -106,6 +191,10 @@ def parse_checks() -> None:
     check("metadata clean_query removes release tags",
           metadata_service.MetadataService.clean_query(
               "The.Matrix.1999.1080p.BluRay.x264-GROUP", 1999) == "The Matrix")
+    candidate = _to_result({"id": "tt8123456", "name": "Test Series"}, "series")
+    check("provider search results retain their type and stable id",
+          candidate.media_type == "series"
+          and candidate.provider_id == "tt8123456")
     check("name refresh is needed for empty episode titles",
           _needs_name_fetch({(1, 1): "Pilot", (1, 2): ""}))
     check("name refresh skips fully named episodes",
@@ -209,6 +298,66 @@ def true_story_checks() -> None:
           not true_story._parse_quotes("'''A film''' is a film.\n", 5))
 
 
+def backup_checks(target: Path) -> None:
+    config_names = (
+        "APP_DIR", "DATA_DIR", "DB_PATH", "SETTINGS_PATH",
+        "THUMB_CACHE_DIR", "PEOPLE_CACHE_DIR", "WATCHED_ELSEWHERE_DIR",
+        "MOVIES_DIR", "SERIES_DIR", "ORGANIZER_DIR", "PLAYERS", "PLAYER",
+    )
+    original = {name: getattr(config, name) for name in config_names}
+    app_dir = target / "backup_probe"
+    config.APP_DIR = app_dir
+    config.DATA_DIR = app_dir / "data"
+    config.DB_PATH = config.DATA_DIR / "library.db"
+    config.SETTINGS_PATH = app_dir / "settings.json"
+    config.THUMB_CACHE_DIR = config.DATA_DIR / "thumbs"
+    config.PEOPLE_CACHE_DIR = config.DATA_DIR / "people"
+    config.WATCHED_ELSEWHERE_DIR = config.DATA_DIR / "watched_elsewhere"
+    try:
+        app_dir.mkdir(parents=True, exist_ok=True)
+        config.SETTINGS_PATH.write_text("{}\n", encoding="utf-8")
+        db = Database(config.DB_PATH)
+        db.add_watched_elsewhere({
+            "provider": "Cinemeta", "provider_id": "tt8123456",
+            "imdb_id": "tt8123456", "title": "Offline Backup Test",
+            "media_type": "movie",
+        })
+        db.close()
+        artwork = config.WATCHED_ELSEWHERE_DIR / "artwork" / "poster.jpg"
+        artwork.parent.mkdir(parents=True, exist_ok=True)
+        artwork.write_bytes(b"saved artwork")
+        archive = app_dir / "backup.zip"
+        ok, message = config.backup_library(archive)
+        includes_artwork = False
+        if ok:
+            with zipfile.ZipFile(archive) as saved_archive:
+                includes_artwork = (
+                    "watched_elsewhere/artwork/poster.jpg"
+                    in saved_archive.namelist()
+                )
+        check("backup includes watched-elsewhere artwork",
+              ok and "saved" in message.lower() and includes_artwork)
+        valid, _ = config.validate_library_backup(archive)
+        check("backup with watched-elsewhere records validates", valid)
+        artwork.write_bytes(b"changed")
+        restored, _ = config.restore_library_backup(archive)
+        restored_db = Database(config.DB_PATH)
+        saved = restored_db.list_watched_elsewhere()
+        check("restore recovers the offline catalog and artwork",
+              restored and len(saved) == 1
+              and saved[0]["imdb_id"] == "tt8123456"
+              and artwork.read_bytes() == b"saved artwork")
+        restored_db.close()
+    except Exception as exc:
+        print(f"[FAIL] watched-elsewhere backup smoke raised {exc!r}")
+        import traceback
+        traceback.print_exc()
+        check("watched-elsewhere backup smoke completes", False)
+    finally:
+        for name, value in original.items():
+            setattr(config, name, value)
+
+
 def scanner_db_checks(target: Path) -> None:
     started = time.perf_counter()
     items = scan(target / "Movies", target / "Series")
@@ -244,6 +393,56 @@ def scanner_db_checks(target: Path) -> None:
     db.sync(items)
     again = db.get(row["id"])
     check("metadata survives rescan", again["plot"] == "Saved plot" and again["rating"] == 7.5)
+
+    # --- the separate Watched Elsewhere catalog ---
+    db.save_metadata(row["id"], {"imdb_id": "tt7000005"})
+    elsewhere_id = db.add_watched_elsewhere({
+        "provider": "Cinemeta", "provider_id": "tt7000005",
+        "imdb_id": "tt7000005", "title": "Test Movie 5", "year": 2005,
+        "media_type": "movie", "plot": "A watched-elsewhere plot.",
+        "genres": ["Drama"], "cast": ["An Actor"],
+    })
+    elsewhere = db.get_watched_elsewhere(elsewhere_id)
+    check("watched-elsewhere metadata is saved independently",
+          elsewhere is not None
+          and elsewhere["plot"] == "A watched-elsewhere plot."
+          and elsewhere["genres"] == ["Drama"])
+    check("watched-elsewhere title suggests its matching local copy",
+          [match["id"] for match in
+           db.find_watched_elsewhere_local_matches(elsewhere_id)] == [row["id"]])
+    db.save_metadata(row["id"], {"plot": "Changed local plot."})
+    check("local metadata edits leave the saved snapshot alone",
+          db.get_watched_elsewhere(elsewhere_id)["plot"]
+          == "A watched-elsewhere plot.")
+    db.set_media_watched(row["id"], False)
+    db.set_watched_elsewhere(elsewhere_id, True)
+    check("watched-elsewhere watched state is separate",
+          db.get_watched_elsewhere(elsewhere_id)["watched"]
+          and not db.get(row["id"])["watched"])
+    db.set_watched_elsewhere_my_rating(elsewhere_id, 4)
+    check("watched-elsewhere personal rating is stored separately",
+          db.get_watched_elsewhere(elsewhere_id)["my_rating"] == 4
+          and db.get(row["id"])["my_rating"] is None)
+    check("rescan leaves watched-elsewhere records alone",
+          len(db.list_watched_elsewhere()) == 1
+          and len(db.load_all()) == 410)
+    duplicate_id = db.add_watched_elsewhere({
+        "provider": "Cinemeta", "provider_id": "tt7000005",
+        "imdb_id": "tt7000005", "title": "Test Movie 5 (updated)",
+        "year": 2005, "media_type": "movie",
+        "plot": "Updated offline plot.",
+    })
+    check("saving the same provider title updates one record",
+          duplicate_id == elsewhere_id
+          and len(db.list_watched_elsewhere()) == 1
+          and db.get_watched_elsewhere(elsewhere_id)["watched"]
+          and db.get_watched_elsewhere(elsewhere_id)["my_rating"] == 4
+          and db.get_watched_elsewhere(elsewhere_id)["plot"]
+          == "Updated offline plot.")
+    db.delete_watched_elsewhere(elsewhere_id)
+    check("a watched-elsewhere record can be removed",
+          db.list_watched_elsewhere() == [])
+    backup_checks(target)
 
     # --- the flag that says "this story is based on a true story" ---
     db.set_true_story(row["id"], True)
@@ -628,6 +827,46 @@ def organizer_checks(target: Path) -> None:
     check("the movie year is read back", next(
         i for i in items if i.title == "Inception").year == 2010)
 
+    transfer_source = target / "Transfer Source"
+    movie_folder = transfer_source / "Movie 2020"
+    series_folder = transfer_source / "Show"
+    conflict_folder = transfer_source / "Already Exists"
+    for folder in (movie_folder, series_folder, conflict_folder):
+        folder.mkdir(parents=True, exist_ok=True)
+    movie_file = movie_folder / "Movie.mkv"
+    series_file = series_folder / "Season 1" / "Show S01E01.mkv"
+    conflict_file = conflict_folder / "Conflict.mkv"
+    for file in (movie_file, series_file, conflict_file):
+        file.parent.mkdir(parents=True, exist_ok=True)
+        file.write_bytes(b"x")
+    movies_root = target / "Library Movies"
+    series_root = target / "Library Series"
+    existing_conflict = movies_root / conflict_folder.name
+    existing_conflict.mkdir(parents=True)
+    (existing_conflict / "keep.mkv").write_bytes(b"keep")
+
+    transferred, transfer_problems = organizer.transfer_organized_folders(
+        [("movie", movie_folder), ("series", series_folder),
+         ("movie", conflict_folder)],
+        movies_root, series_root,
+    )
+    check("organized movie and series folders go to their configured roots",
+          (movies_root / movie_folder.name / movie_file.name).is_file()
+          and (series_root / series_folder.name / "Season 1"
+               / series_file.name).is_file())
+    check("a destination conflict is skipped without overwriting",
+          conflict_file.is_file()
+          and (existing_conflict / "keep.mkv").is_file()
+          and len(transfer_problems) == 1)
+
+    restored, restore_problems = organizer.restore_transferred_folders(transferred)
+    check("transferred folders can be restored for organizer undo",
+          (transfer_source / movie_folder.name / movie_file.name).is_file()
+          and (transfer_source / series_folder.name / "Season 1"
+               / series_file.name).is_file()
+          and not restore_problems
+          and len(restored) == 2)
+
     # --- renaming episode files out of the fetched titles ---
     chain_file = target / "Show S03E23E24.mkv"
     chain_file.write_bytes(b"x")
@@ -682,6 +921,7 @@ def organizer_checks(target: Path) -> None:
 def ui_checks(target: Path) -> None:
     image_utils.ensure_placeholder(config.PLACEHOLDER_PATH)
     config.THUMB_CACHE_DIR = target / "thumbs"
+    config.WATCHED_ELSEWHERE_DIR = target / "watched_elsewhere"
     # a player of the user would be started by the play button - the test
     # must not open anything
     saved_player = config.PLAYER
@@ -692,11 +932,21 @@ def ui_checks(target: Path) -> None:
     db = Database(target / "library.db")
 
     from ui.main_window import MainWindow
-    from ui import settings_view
+    from ui import organizer_view, settings_view
     app = MainWindow(root, db, movies_dir=target / "Movies", series_dir=target / "Series")
 
     results: list[str] = []
     attempts = {"n": 0}
+
+    def pump_until(predicate, timeout: float = 3.0) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            root.update()
+            if predicate():
+                return True
+            time.sleep(0.01)
+        root.update()
+        return bool(predicate())
 
     def poll() -> None:
         if app._scan_running:
@@ -708,6 +958,274 @@ def ui_checks(target: Path) -> None:
                   "Scan finished" in app._status_left.cget("text"))
             check("rescan button is usable again",
                   str(app._rescan_btn.cget("state")) == "normal")
+            app._sort.focus_force()
+            app._sort.current(1)
+            app._sort.selection_range(0, "end")
+            app._sort.event_generate("<<ComboboxSelected>>")
+            root.update()
+            check("choosing a sort does not leave the control focused",
+                  root.focus_get() is not app._sort)
+            check("choosing a sort clears the selected text",
+                  not app._sort.selection_present()
+                  and app._sort.get() == "Title  Z→A")
+
+            app._sort.event_generate("<Button-1>")
+            root.update()
+            popup = root.tk.call("ttk::combobox::PopdownWindow", str(app._sort))
+            popup_list = f"{popup}.f.l"
+            check("sort options use the dark theme",
+                  root.tk.call(popup_list, "cget", "-background") == "#0a0c10"
+                  and root.tk.call(popup_list, "cget", "-foreground") == "#e8eaed"
+                  and root.tk.call(popup_list, "cget", "-selectbackground") == "#243046"
+                  and root.tk.call(popup_list, "cget", "-selectforeground") == "#e8eaed")
+            root.tk.call("ttk::combobox::Unpost", str(app._sort))
+            app._sort.current(0)
+            app._sort_key = 0
+            app._apply_filters(reset_scroll=True)
+
+            metadata_service.set_service(FakeProvider())
+            local_match = next(
+                item for item in app._all_items
+                if item["title"] == "Test Movie 42")
+            app._db.save_metadata(local_match["id"], {"imdb_id": "tt0000001"})
+            app._set_section("elsewhere")
+            root.update()
+            check("Watched Elsewhere has a separate screen",
+                  app._elsewhere.winfo_ismapped()
+                  and not app._topbar.winfo_ismapped())
+            root.update()
+            check("Watched Elsewhere keeps its open action below each list",
+                  app._elsewhere._results_open.winfo_rooty()
+                  >= app._elsewhere._results.winfo_rooty()
+                  + app._elsewhere._results.winfo_height()
+                  and app._elsewhere._saved_open.winfo_rooty()
+                  >= app._elsewhere._saved.winfo_rooty()
+                  + app._elsewhere._saved.winfo_height())
+            check("empty Watched Elsewhere panes explain what to do",
+                  find_widget(
+                      app._elsewhere,
+                      "Search for a movie or series to see provider results.",
+                  ) is not None
+                  and find_widget(
+                      app._elsewhere, "Saved titles appear here after you add them."
+                  ) is not None
+                  and str(app._elsewhere._results_open.cget("state")) == "disabled"
+                  and str(app._elsewhere._saved_open.cget("state")) == "disabled")
+            app._elsewhere._query.insert(0, "x" * 201)
+            app._elsewhere.search()
+            check("Watched Elsewhere bounds provider search input",
+                  app._elsewhere._status.cget("text")
+                  == "Search text must be 200 characters or fewer."
+                  and str(app._elsewhere._search_btn.cget("state")) == "normal")
+            app._elsewhere._query.delete(0, "end")
+            app._elsewhere._query.insert(0, "Outside Title")
+            app._elsewhere.search()
+            check("Watched Elsewhere searches the provider",
+                  pump_until(lambda: bool(app._elsewhere._results.get_children())))
+            check("search results update the pane count",
+                  app._elsewhere._results_heading.cget("text") == "Search results · 1")
+            candidate_id = app._elsewhere._results.get_children()[0]
+            app._elsewhere._results.selection_set(candidate_id)
+            root.update()
+            check("open details enables only after selecting a result",
+                  str(app._elsewhere._results_open.cget("state")) == "normal"
+                  and str(app._elsewhere._saved_open.cget("state")) == "disabled")
+            app._elsewhere._open_result()
+            check("provider result opens the shared details view",
+                  pump_until(lambda: (
+                      app._details.winfo_ismapped()
+                      and app._details._item is not None
+                      and app._details._item.get("source") == "elsewhere"
+                  )))
+            save_button = find_button(app._details, "Save to Watched Elsewhere")
+            check("provider result can be saved separately",
+                  save_button is not None)
+            if save_button is not None:
+                save_button.invoke()
+            root.update()
+            saved_items = app._db.list_watched_elsewhere()
+            check("saved metadata stays outside the local library",
+                  len(saved_items) == 1 and len(app._db.load_all()) == 410
+                  and saved_items[0]["plot"] == "Test plot"
+                  and app._elsewhere._saved_heading.cget("text") == "Saved titles · 1")
+            check("a likely local copy is suggested without merging",
+                  any(match["id"] == local_match["id"]
+                      for match in app._details._item["local_matches"])
+                  and find_widget(app._details, "Possible local copy") is not None)
+            match_year = local_match.get("year")
+            match_label = f"Open local title: {local_match['title']}"
+            if match_year:
+                match_label += f" ({match_year})"
+            match_button = find_button(app._details, match_label)
+            if match_button is not None:
+                match_button.invoke()
+            check("the local suggestion opens the independent local record",
+                  app._details._item is not None
+                  and app._details._item.get("id") == local_match["id"]
+                  and app._details._item.get("source") != "elsewhere")
+            app._back_from_details()
+            root.update()
+            app._elsewhere._saved.selection_set(str(saved_items[0]["id"]))
+            app._elsewhere._open_saved()
+            root.update()
+            local_rating_before = app._db.get(local_match["id"]).get("my_rating")
+            saved_title_before_rating = app._details._item["title"]
+            app._details._rate(4)
+            root.update()
+            rated_elsewhere = app._db.get_watched_elsewhere(saved_items[0]["id"])
+            local_after_rating = app._db.get(local_match["id"])
+            check("rating a saved external title keeps its details page open",
+                  app._details._item is not None
+                  and app._details._item.get("source") == "elsewhere"
+                  and app._details._item.get("title") == saved_title_before_rating)
+            check("external personal rating is stored separately from local rating",
+                  rated_elsewhere is not None
+                  and rated_elsewhere.get("my_rating") == 4
+                  and local_after_rating is not None
+                  and local_after_rating.get("my_rating") == local_rating_before)
+            watched_button = find_button(app._details, "Mark as Watched")
+            if watched_button is not None:
+                watched_button.invoke()
+            root.update()
+            refreshed_elsewhere = app._db.list_watched_elsewhere()
+            local_unchanged = app._db.get(local_match["id"])
+            check("Watched Elsewhere has its own watched state",
+                  bool(refreshed_elsewhere)
+                  and bool(refreshed_elsewhere[0]["watched"])
+                  and refreshed_elsewhere[0].get("my_rating") == 4
+                  and app._details._item.get("my_rating") == 4
+                  and local_unchanged is not None
+                  and not local_unchanged.get("watched"))
+            app._back_from_details()
+            root.update()
+            check("Back returns to the separate catalog",
+                  app._elsewhere.winfo_ismapped())
+            app._elsewhere._saved.selection_set(str(saved_items[0]["id"]))
+            root.update()
+            check("saved watched titles offer the unwatched icon and tooltip",
+                  app._elsewhere._saved_watch.cget("image")
+                  == str(app._elsewhere._saved_watch_icons[True])
+                  and app._elsewhere._saved_watch_help
+                  == "Mark this title as unwatched"
+                  and str(app._elsewhere._saved_watch.cget("state")) == "normal")
+            panel_left = app._elsewhere._saved_panel.winfo_rootx()
+            panel_right = panel_left + app._elsewhere._saved_panel.winfo_width()
+            watch_left = app._elsewhere._saved_watch.winfo_rootx()
+            watch_right = watch_left + app._elsewhere._saved_watch.winfo_width()
+            remove_left = app._elsewhere._saved_remove.winfo_rootx()
+            remove_right = remove_left + app._elsewhere._saved_remove.winfo_width()
+            open_left = app._elsewhere._saved_open.winfo_rootx()
+            open_right = open_left + app._elsewhere._saved_open.winfo_width()
+            check("saved-title actions fit inside their panel without overlap",
+                  panel_left <= watch_left < watch_right <= remove_left
+                  < remove_right <= open_left < open_right <= panel_right)
+            check("saved-title icon buttons match Open details padding and spacing",
+                  all(
+                      app._elsewhere._saved_open.cget(option)
+                      == widget.cget(option)
+                      for widget in (
+                          app._elsewhere._saved_watch,
+                          app._elsewhere._saved_remove,
+                      )
+                      for option in ("padx", "pady")
+                  )
+                  and open_left - remove_right >= 8)
+            check("saved-title icon actions share one row",
+                  abs(
+                      (app._elsewhere._saved_watch.winfo_rooty()
+                       + app._elsewhere._saved_watch.winfo_height() / 2)
+                      - (app._elsewhere._saved_remove.winfo_rooty()
+                         + app._elsewhere._saved_remove.winfo_height() / 2)
+                  ) <= 1
+                  and app._elsewhere._saved_watch.cget("image")
+                  and app._elsewhere._saved_remove.cget("image")
+                  and app._elsewhere._saved_watch_help
+                  == "Mark this title as unwatched"
+                  and app._elsewhere._saved_remove_help
+                  == "Remove this title and its saved artwork"
+                  and abs(
+                      (app._elsewhere._saved_open.winfo_rooty()
+                       + app._elsewhere._saved_open.winfo_height() / 2)
+                      - (app._elsewhere._saved_watch.winfo_rooty()
+                         + app._elsewhere._saved_watch.winfo_height() / 2)
+                  ) <= 1)
+            app._elsewhere._saved_watch.invoke()
+            root.update()
+            unwatched_item = app._db.get_watched_elsewhere(saved_items[0]["id"])
+            check("Mark as Unwatched updates the saved title",
+                  unwatched_item is not None
+                  and not unwatched_item["watched"]
+                  and app._elsewhere._saved.set(str(saved_items[0]["id"]), "watched")
+                  == "No"
+                  and app._elsewhere._saved_watch.cget("image")
+                  == str(app._elsewhere._saved_watch_icons[False])
+                  and app._elsewhere._saved_watch_help
+                  == "Mark this title as watched")
+            app._elsewhere._saved_watch.invoke()
+            root.update()
+            check("saved titles can be marked watched again",
+                  bool(app._db.get_watched_elsewhere(saved_items[0]["id"])["watched"])
+                  and app._elsewhere._saved_watch.cget("image")
+                  == str(app._elsewhere._saved_watch_icons[True])
+                  and app._elsewhere._saved_watch_help
+                  == "Mark this title as unwatched")
+            from ui import watched_elsewhere_view
+            from unittest.mock import patch
+            saved_record = app._db.get_watched_elsewhere(saved_items[0]["id"])
+            artwork_key = (
+                f"{saved_record['provider'].casefold()}|"
+                f"{saved_record['media_type']}|"
+                f"{saved_record['provider_id'].casefold()}"
+            )
+            artwork_dir = (
+                config.WATCHED_ELSEWHERE_DIR
+                / hashlib.sha256(artwork_key.encode("utf-8")).hexdigest()[:24]
+            )
+            artwork_dir.mkdir(parents=True, exist_ok=True)
+            poster = artwork_dir / "poster.jpg"
+            backdrop = artwork_dir / "poster2.jpg"
+            poster.write_bytes(b"poster")
+            backdrop.write_bytes(b"backdrop")
+            saved_record["poster_path"] = str(poster)
+            saved_record["poster2_path"] = str(backdrop)
+            app._db.add_watched_elsewhere(saved_record)
+            app._elsewhere.refresh_saved(selected_id=saved_items[0]["id"])
+            outside_artwork = target / "outside-poster.jpg"
+            outside_artwork.write_bytes(b"keep")
+            invalid_artwork = dict(saved_record)
+            invalid_artwork["poster_path"] = str(outside_artwork)
+            try:
+                watched_elsewhere_view.WatchedElsewhereView._remove_saved_artwork(
+                    invalid_artwork)
+                rejected_outside_path = False
+            except ValueError:
+                rejected_outside_path = True
+            check("saved-title removal refuses artwork outside its cache",
+                  rejected_outside_path and outside_artwork.is_file()
+                  and poster.is_file() and backdrop.is_file())
+            with patch.object(
+                watched_elsewhere_view, "ConfirmDialog",
+                return_value=SimpleNamespace(ask=lambda: False),
+            ):
+                app._elsewhere._saved_remove.invoke()
+            root.update()
+            check("cancelling removal keeps the title and its artwork",
+                  app._db.get_watched_elsewhere(saved_items[0]["id"]) is not None
+                  and poster.is_file() and backdrop.is_file())
+            with patch.object(
+                watched_elsewhere_view, "ConfirmDialog",
+                return_value=SimpleNamespace(ask=lambda: True),
+            ):
+                app._elsewhere._saved_remove.invoke()
+            root.update()
+            check("saved title removal deletes and refreshes the catalog",
+                  app._db.get_watched_elsewhere(saved_items[0]["id"]) is None
+                  and not app._elsewhere._saved.get_children()
+                  and str(app._elsewhere._saved_remove.cget("state")) == "disabled"
+                  and not poster.exists() and not backdrop.exists()
+                  and not artwork_dir.exists())
+            app._set_section("all")
+            root.update()
             lib = app._library
             for _ in range(60):
                 lib.canvas.yview_scroll(55, "units")
@@ -827,6 +1345,49 @@ def ui_checks(target: Path) -> None:
             app._search_text = ""
             app._apply_filters()
             root.update()
+            app._search_text = "series 0"
+            app._search.delete(0, "end")
+            app._search.insert(0, "series 0")
+            app._set_chip("cast", "Cillian Murphy")
+            lib.show_person_profile(
+                "Cillian Murphy", "cast",
+                {"name": "Cillian Murphy", "extract": "Irish actor."},
+            )
+            root.update()
+            chip_clear = find_button(app._chip_bar, "✕")
+            if chip_clear is not None:
+                chip_clear.invoke()
+            root.update()
+            check("clearing a person chip closes its profile and preserves search",
+                  chip_clear is not None
+                  and not lib._profile_panel.winfo_ismapped()
+                  and app._chip_kind is None
+                  and app._search_text == "series 0"
+                  and app._search.get() == "series 0"
+                  and app._visible_items
+                  and len(app._visible_items) < len(app._all_items))
+
+            app._search_text = ""
+            app._search.delete(0, "end")
+            app._apply_filters()
+            app._set_chip("cast", "Cillian Murphy")
+            lib.show_person_profile(
+                "Cillian Murphy", "cast",
+                {"name": "Cillian Murphy", "extract": "Irish actor."},
+            )
+            root.update()
+            profile_close = find_button(lib._profile_panel, "Close")
+            if profile_close is not None:
+                profile_close.invoke()
+            root.update()
+            check("closing a person profile clears its chip",
+                  profile_close is not None
+                  and not lib._profile_panel.winfo_ismapped()
+                  and app._chip_kind is None)
+
+            app._search_text = ""
+            app._apply_filters()
+            root.update()
             check("the view toggles are gone", not hasattr(app, "_view_buttons"))
             check("the sidebar has an add-folder button",
                   find_widget(app, "Add Folder") is not None)
@@ -882,6 +1443,12 @@ def ui_checks(target: Path) -> None:
             app._db.set_true_story(movie["id"], True, "Test Movie 0 (film)")
             app._open_settings()
             root.update()
+            indicator = app._settings._tab_indicator
+            general_tab = app._settings._tab_buttons["general"]
+            check("the General tab indicator aligns on first display",
+                  indicator.winfo_x() == general_tab.winfo_x()
+                  and indicator.winfo_width() == general_tab.winfo_width()
+                  and indicator.winfo_y() == general_tab.winfo_height() - 2)
             app._settings._select_tab("deeper")
             root.update()
             check("Dig Deeper status has its own row above the controls",
@@ -1150,6 +1717,9 @@ def ui_checks(target: Path) -> None:
             root.update()
             check("the settings have a player list",
                   bool(app._settings._player_combo.cget("values")))
+            check("General settings no longer show Organizer destination",
+                  find_widget(app._settings, "Organizer destination") is None
+                  and not hasattr(app._settings, "_organizer_var"))
             saved_path = config.SETTINGS_PATH
             try:
                 config.SETTINGS_PATH = target / "settings.json"
@@ -1159,6 +1729,19 @@ def ui_checks(target: Path) -> None:
                 app._settings._refresh_players()
                 check("the player list shows the player",
                       "Test" in app._settings._player_combo.cget("values"))
+                remembered_source = str(target / "Organizer source")
+                config.save_settings({"organizer_dir": remembered_source})
+                settings_saved = app._settings._on_saved
+                app._settings._on_saved = None
+                try:
+                    app._settings._movies_var.set(str(target / "Movies"))
+                    app._settings._series_var.set(str(target / "Series"))
+                    app._settings._save()
+                    check("saving General settings preserves the Organizer source",
+                          config.load_settings().get("organizer_dir")
+                          == remembered_source)
+                finally:
+                    app._settings._on_saved = settings_saved
             finally:
                 config.SETTINGS_PATH = saved_path
                 config.init()
@@ -1201,6 +1784,45 @@ def ui_checks(target: Path) -> None:
                         break
                     time.sleep(0.05)
                 check("the organizer puts the file back", film.exists())
+
+            old_movies_dir = config.MOVIES_DIR
+            old_series_dir = config.SERIES_DIR
+            old_rescan = org._on_rescan
+            transfer_source = target / "Organizer transfer"
+            transfer_source.mkdir(exist_ok=True)
+            transfer_film = transfer_source / "Arrival.2016.1080p.mkv"
+            transfer_film.write_bytes(b"x")
+            movie_library = target / "Transferred movies"
+            series_library = target / "Transferred series"
+            config.MOVIES_DIR = movie_library
+            config.SERIES_DIR = series_library
+            org._on_rescan = None
+            try:
+                org._path_var.set(str(transfer_source))
+                org._scan()
+                check("the transfer smoke scan completes",
+                      pump_until(lambda: not org._running))
+                if org._entries:
+                    organizer.move_entry(org._entries[0], transfer_source)
+                    org._finished()
+                with patch.object(
+                    organizer_view, "ConfirmDialog",
+                    return_value=SimpleNamespace(ask=lambda: True),
+                ):
+                    org._move_to_library_btn.invoke()
+                    check("the organizer transfers its movie folder",
+                          pump_until(lambda: not org._running)
+                          and (movie_library / org._entries[0].folder
+                               / transfer_film.name).is_file())
+                    org._undo_btn.invoke()
+                    check("organizer Undo reverses the transfer and file move",
+                          pump_until(lambda: not org._running)
+                          and transfer_film.is_file()
+                          and not (movie_library / org._entries[0].folder).exists())
+            finally:
+                config.MOVIES_DIR = old_movies_dir
+                config.SERIES_DIR = old_series_dir
+                org._on_rescan = old_rescan
 
             # the EP renamer renames the episode files of a series
             app._settings._select_tab("renamer")
@@ -1501,6 +2123,7 @@ def main() -> None:
     target = Path(args.target or tempfile.mkdtemp(prefix="cinema_smoke_"))
     fresh = args.target is None
     build(target)
+    artwork_boundary_checks()
     if run("parse"):
         parse_checks()
     if run("story"):

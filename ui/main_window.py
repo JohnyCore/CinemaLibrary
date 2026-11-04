@@ -1,19 +1,29 @@
 from __future__ import annotations
 
+import hashlib
+import ipaddress
 import json
 import logging
+import os
 import queue
 import random
 import re
+import socket
 import threading
 import time
 import tkinter as tk
 from tkinter import ttk
+from io import BytesIO
 from pathlib import Path
+from urllib.parse import urlsplit
+from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 from typing import Callable
+
+from PIL import Image, UnidentifiedImageError
 
 import config
 from database.db_manager import Database
+from metadata import metadata_service
 from metadata.person_profiles import fetch_person_profile, person_key
 from scanner import scan_state
 from scanner.library_scanner import scan
@@ -23,6 +33,7 @@ from ui.folder_dialog import FolderDialog
 from ui.icons import photo as icon_photo
 from ui.library_view import LibraryView
 from ui.settings_view import SettingsView
+from ui.watched_elsewhere_view import WatchedElsewhereView
 from utils import media_ops
 from utils.image_cache import ImageCache
 
@@ -46,8 +57,45 @@ SECTIONS = (
     ("all", "All Library"),
     ("movie", "Movies"),
     ("series", "TV Series"),
+    ("elsewhere", "Watched Elsewhere"),
     ("insights", "Insights"),
 )
+
+_CINEMETA_ART_HOSTS = {"images.metahub.space", "images.strem.io"}
+_MAX_ART_BYTES = 12 * 1024 * 1024
+_MAX_ART_PIXELS = 25_000_000
+
+
+def _validated_cinemeta_art_url(url: str | None) -> str | None:
+    if not url:
+        return None
+    try:
+        parts = urlsplit(url)
+        if (
+            parts.scheme != "https"
+            or parts.hostname not in _CINEMETA_ART_HOSTS
+            or parts.username is not None
+            or parts.password is not None
+            or parts.port not in (None, 443)
+        ):
+            return None
+    except ValueError:
+        return None
+    return url
+
+
+def _are_public_art_addresses(addresses: list[str]) -> bool:
+    if not addresses:
+        return False
+    try:
+        return all(ipaddress.ip_address(address).is_global for address in addresses)
+    except ValueError:
+        return False
+
+
+class _CinemetaRedirectHandler(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
 
 
 def _flag(term: str, default: bool = True) -> bool:
@@ -116,6 +164,10 @@ _YEAR_AFTER_RE = re.compile(r"(?<!\d)(\d{4})-(?!\d)")
 
 
 def setup_styles(root: tk.Tk) -> None:
+    root.option_add("*TCombobox*Listbox.background", ENTRY_BG)
+    root.option_add("*TCombobox*Listbox.foreground", TEXT)
+    root.option_add("*TCombobox*Listbox.selectBackground", "#243046")
+    root.option_add("*TCombobox*Listbox.selectForeground", TEXT)
     style = ttk.Style(root)
     style.theme_use("clam")
     style.configure(
@@ -194,6 +246,8 @@ class MainWindow(tk.Frame):
         self._chip_value: str | None = None
         self._collections: list[dict] = []
         self._person_profile_generation = 0
+        self._elsewhere_open_generation = 0
+        self._detail_return_section = "all"
 
         setup_styles(root)
 
@@ -306,6 +360,7 @@ class MainWindow(tk.Frame):
 
         top = tk.Frame(column, bg=TOPBAR_BG)
         top.pack(fill="x")
+        self._topbar = top
 
         search_box = tk.Frame(top, bg=ENTRY_BG, highlightthickness=1,
                               highlightbackground=BORDER)
@@ -361,14 +416,23 @@ class MainWindow(tk.Frame):
 
         body = tk.Frame(column, bg=BG)
         body.pack(fill="both", expand=True)
+        self._body = body
 
         self._details = DetailsView(
-            body, self._images, self._show_library, self._db,
+            body, self._images, self._back_from_details, self._db,
             self._on_item_fetched, self._on_filter_from_details,
             post=self._post, on_person=self._show_person_profile,
+            on_elsewhere_save=self._save_elsewhere_item,
+            on_elsewhere_watched=self._refresh_elsewhere,
+            on_open_local_match=self._open_elsewhere_local_match,
         )
         self._library = LibraryView(body, self._images, self._open_item,
-                                    self._show_context_menu)
+                                    self._show_context_menu,
+                                    on_profile_close=self._clear_chip)
+        self._elsewhere = WatchedElsewhereView(
+            body, self._db, self._open_elsewhere_candidate,
+            self._open_elsewhere_saved, self._post,
+        )
         self._insights = tk.Frame(body, bg=BG)
         self._settings = SettingsView(body, self._on_settings_saved, self._db, self._images,
                                   on_changed=self._on_items_fetched, post=self._post,
@@ -452,6 +516,12 @@ class MainWindow(tk.Frame):
         self._positions = {item.get("id"): i for i, item in enumerate(self._all_items)}
         self._render_insights()
         self._apply_filters()
+        if self._details.winfo_ismapped():
+            current = self._details._item
+            if current is not None and current.get("source") == "elsewhere":
+                refreshed = dict(current)
+                refreshed["local_matches"] = self._db.find_local_matches(refreshed)
+                self._details.show(refreshed)
 
     def _search_blob(self, item: dict) -> str:
         parts = [
@@ -692,19 +762,31 @@ class MainWindow(tk.Frame):
                 fg=TEXT if active else MUTED,
                 bg="#1a2130" if active else SIDEBAR_BG,
             )
+        self._details.hide()
+        self._details.pack_forget()
+        self._settings.pack_forget()
+        self._settings_btn.configure(fg=MUTED, bg=SIDEBAR_BG)
+        if section == "elsewhere":
+            self._library.pack_forget()
+            self._insights.pack_forget()
+            self._topbar.pack_forget()
+            self._elsewhere.refresh_saved()
+            self._elsewhere.pack(fill="both", expand=True)
+            return
+        self._elsewhere.pack_forget()
+        self._show_topbar()
         if section == "insights":
-            self._details.hide()
-            self._details.pack_forget()
-            self._settings.pack_forget()
-            self._settings_btn.configure(fg=MUTED, bg=SIDEBAR_BG)
             self._library.pack_forget()
             self._insights.pack(fill="both", expand=True)
             self._render_insights()
             return
-        self._settings_btn.configure(fg=MUTED, bg=SIDEBAR_BG)
         if not self._library.winfo_ismapped():
             self._show_library()
         self._apply_filters(reset_scroll=True)
+
+    def _show_topbar(self) -> None:
+        if not self._topbar.winfo_ismapped():
+            self._topbar.pack(fill="x", before=self._body)
 
     def _on_search_key(self, event=None) -> None:
         if self._search_job is not None:
@@ -734,19 +816,198 @@ class MainWindow(tk.Frame):
         except ValueError:
             self._sort_key = 0
         self._apply_filters(reset_scroll=True)
+        self._sort.selection_clear()
+        self.focus_set()
 
     # --- navigation ---------------------------------------------------
 
-    def _open_item(self, item: dict) -> None:
+    def _open_item(self, item: dict, return_section: str | None = None) -> None:
+        self._detail_return_section = return_section or self._section
         self._settings.pack_forget()
         self._insights.pack_forget()
+        self._elsewhere.pack_forget()
         self._settings_btn.configure(fg=MUTED, bg=SIDEBAR_BG)
         self._library.pack_forget()
+        if self._detail_return_section == "elsewhere":
+            self._topbar.pack_forget()
+        else:
+            self._show_topbar()
         # pack the view before it is filled: if building the panel fails,
         # the details view is still there instead of an empty black area
         self._details.pack(fill="both", expand=True)
         self._details.show(item)
         self._details.lift()
+
+    def _back_from_details(self) -> None:
+        if self._detail_return_section == "elsewhere":
+            self._set_section("elsewhere")
+        else:
+            self._show_library()
+
+    def _open_elsewhere_saved(self, item_id: int) -> None:
+        item = self._db.get_watched_elsewhere(item_id)
+        if item is None:
+            self._elsewhere.set_status("That saved title no longer exists.")
+            self._elsewhere.refresh_saved()
+            return
+        item["catalog_saved"] = True
+        item["local_matches"] = self._db.find_watched_elsewhere_local_matches(item_id)
+        self._open_item(item, return_section="elsewhere")
+
+    def _open_elsewhere_candidate(self, candidate) -> None:
+        self._elsewhere_open_generation += 1
+        generation = self._elsewhere_open_generation
+        self._elsewhere.set_status("Loading title details and artwork…")
+        media_type = candidate.media_type if candidate.media_type in ("movie", "series") else "movie"
+        provider_id = candidate.provider_id or candidate.imdb_id
+        provider = candidate.provider or "Cinemeta"
+        fallback_identity = f"{candidate.title or ''}|{candidate.year or ''}"
+        cache_key = (
+            f"{provider.casefold()}|{media_type}|{provider_id or fallback_identity}")
+
+        def worker() -> None:
+            item = None
+            error = None
+            artwork_error = None
+            try:
+                result = metadata_service.fetch_metadata(
+                    candidate.title or "", candidate.year, media_type,
+                    candidate.imdb_id,
+                )
+                if result is None:
+                    raise metadata_service.MetadataError(
+                        "The provider did not return details for this title.")
+                result.media_type = media_type
+                result.provider = result.provider or provider
+                result.provider_id = result.provider_id or provider_id
+                poster_path, poster2_path = self._cache_elsewhere_artwork(
+                    cache_key, result,
+                )
+                if result.poster_url or result.backdrop_url:
+                    if not poster_path and not poster2_path:
+                        artwork_error = "The provider artwork could not be cached."
+                item = {
+                    "id": f"candidate:{cache_key}",
+                    "provider": result.provider,
+                    "provider_id": result.provider_id or cache_key,
+                    "imdb_id": result.imdb_id or candidate.imdb_id,
+                    "title": result.title or candidate.title or "Untitled",
+                    "media_type": result.media_type,
+                    "year": result.year or candidate.year,
+                    "plot": result.plot,
+                    "genres": result.genres,
+                    "rating": result.rating,
+                    "runtime": result.runtime,
+                    "director": result.director,
+                    "writer": result.writer,
+                    "cast_list": result.cast,
+                    "country": result.country,
+                    "release_date": result.release_date,
+                    "poster_path": poster_path,
+                    "poster2_path": poster2_path,
+                    "source": "elsewhere",
+                    "catalog_saved": False,
+                }
+                item["local_matches"] = self._db.find_local_matches(item)
+            except Exception as exc:
+                error = exc
+                log.warning("could not load watched-elsewhere details: %s", exc)
+            self._post(lambda: self._elsewhere_candidate_loaded(
+                generation, item, error, artwork_error))
+
+        threading.Thread(target=self._db.thread_target(worker), daemon=True).start()
+
+    def _cache_elsewhere_artwork(self, cache_key: str, result) -> tuple[str | None, str | None]:
+        if not result.poster_url and not result.backdrop_url:
+            return None, None
+        directory = config.WATCHED_ELSEWHERE_DIR / hashlib.sha256(
+            cache_key.encode("utf-8")).hexdigest()[:24]
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            log.warning("could not create watched-elsewhere artwork directory: %s", exc)
+            return None, None
+        poster = self._cache_one_artwork(result.poster_url, directory / "poster.jpg")
+        backdrop = self._cache_one_artwork(
+            result.backdrop_url, directory / "poster2.jpg")
+        return poster, backdrop
+
+    @staticmethod
+    def _cache_one_artwork(url: str | None, target: Path) -> str | None:
+        if target.is_file():
+            return str(target)
+        safe_url = _validated_cinemeta_art_url(url)
+        if safe_url is None:
+            return None
+        host = urlsplit(safe_url).hostname
+        if host is None:
+            return None
+        temporary = target.with_name(f".{target.name}.part")
+        try:
+            records = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+            addresses = [record[4][0] for record in records]
+            if not _are_public_art_addresses(addresses):
+                raise ValueError("the artwork host resolved to a non-public address")
+            request = Request(safe_url, headers={
+                "User-Agent": "CinemaLibrary",
+                "Accept": "image/*",
+            })
+            opener = build_opener(ProxyHandler({}), _CinemetaRedirectHandler())
+            with opener.open(request, timeout=20) as response:
+                if _validated_cinemeta_art_url(response.geturl()) is None:
+                    raise ValueError("the artwork source redirected to an untrusted host")
+                length = response.headers.get("Content-Length")
+                if length and int(length) > _MAX_ART_BYTES:
+                    raise ValueError("the artwork image is too large")
+                body = response.read(_MAX_ART_BYTES + 1)
+            if len(body) > _MAX_ART_BYTES:
+                raise ValueError("the artwork image is too large")
+            with Image.open(BytesIO(body)) as image:
+                if image.width * image.height > _MAX_ART_PIXELS:
+                    raise ValueError("the artwork image dimensions are too large")
+                image.convert("RGB").save(temporary, "JPEG", quality=90)
+            os.replace(temporary, target)
+            return str(target)
+        except (OSError, ValueError, UnidentifiedImageError,
+                Image.DecompressionBombError) as exc:
+            log.warning("could not cache provider artwork from %s: %s", host, exc)
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                log.warning("could not remove temporary artwork file %s", temporary)
+            return None
+
+    def _elsewhere_candidate_loaded(
+        self, generation: int, item: dict | None, error, artwork_error,
+    ) -> None:
+        if self._closing or generation != self._elsewhere_open_generation:
+            return
+        if error is not None or item is None:
+            self._elsewhere.set_status(f"Could not load title details: {error}")
+            return
+        self._open_item(item, return_section="elsewhere")
+        if artwork_error:
+            self._details._set_status(artwork_error)
+
+    def _save_elsewhere_item(self, item: dict) -> dict:
+        item_id = self._db.add_watched_elsewhere(item)
+        saved = self._db.get_watched_elsewhere(item_id)
+        if saved is None:
+            raise RuntimeError("saved title could not be loaded")
+        saved["catalog_saved"] = True
+        saved["local_matches"] = self._db.find_watched_elsewhere_local_matches(item_id)
+        self._elsewhere.refresh_saved()
+        return saved
+
+    def _refresh_elsewhere(self) -> None:
+        self._elsewhere.refresh_saved()
+
+    def _open_elsewhere_local_match(self, item: dict) -> None:
+        local = self._db.get(item["id"])
+        if local is None:
+            self._details._set_status("That local title no longer exists.")
+            return
+        self._open_item(local, return_section="elsewhere")
 
     def _show_context_menu(self, item: dict, x: int, y: int) -> None:
         """The menu of a card - it works on the whole selection."""
@@ -1306,6 +1567,8 @@ class MainWindow(tk.Frame):
         self._apply_filters(reset_scroll=True)
 
     def _clear_chip(self) -> None:
+        self._person_profile_generation += 1
+        self._library.hide_person_profile()
         self._chip_kind = None
         self._chip_value = None
         self._chip_bar.pack_forget()
@@ -1344,6 +1607,8 @@ class MainWindow(tk.Frame):
         self._details.pack_forget()
         self._library.pack_forget()
         self._insights.pack_forget()
+        self._elsewhere.pack_forget()
+        self._show_topbar()
         self._section = "all"
         self._insights_continue_only = False
         for btn in self._nav.values():
@@ -1368,6 +1633,10 @@ class MainWindow(tk.Frame):
         self._details.pack_forget()
         self._settings.pack_forget()
         self._insights.pack_forget()
+        self._elsewhere.pack_forget()
+        self._show_topbar()
+        if self._section in ("elsewhere", "insights"):
+            self._section = "all"
         self._settings_btn.configure(fg=MUTED, bg=SIDEBAR_BG)
         for key, button in self._nav.items():
             active = key == self._section
@@ -1377,6 +1646,12 @@ class MainWindow(tk.Frame):
         self._apply_filters()
 
     def _escape(self, event=None) -> None:
+        if self._details.winfo_ismapped():
+            self._back_from_details()
+            return
+        if self._elsewhere.winfo_ismapped() or self._insights.winfo_ismapped():
+            self._set_section("all")
+            return
         if not self._library.winfo_ismapped():
             self._show_library()
 

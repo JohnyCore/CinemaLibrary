@@ -39,6 +39,8 @@ class MetadataResult:
     poster_url: str | None = None
     backdrop_url: str | None = None
     provider: str | None = None
+    provider_id: str | None = None
+    media_type: str | None = None
 
 
 class MetadataService:

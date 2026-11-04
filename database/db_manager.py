@@ -91,6 +91,35 @@ CREATE TABLE IF NOT EXISTS person_profiles (
     not_found INTEGER NOT NULL DEFAULT 0,
     fetched_at REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS watched_elsewhere (
+    id INTEGER PRIMARY KEY,
+    provider TEXT NOT NULL,
+    provider_id TEXT NOT NULL,
+    source_key TEXT NOT NULL UNIQUE,
+    imdb_id TEXT,
+    title TEXT NOT NULL,
+    media_type TEXT NOT NULL CHECK (media_type IN ('movie', 'series')),
+    year INTEGER,
+    plot TEXT,
+    genres TEXT,
+    rating REAL,
+    my_rating INTEGER,
+    runtime INTEGER,
+    director TEXT,
+    writer TEXT,
+    cast_list TEXT,
+    country TEXT,
+    release_date TEXT,
+    poster_path TEXT,
+    poster2_path TEXT,
+    watched INTEGER NOT NULL DEFAULT 0,
+    last_watched REAL,
+    added_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_watched_elsewhere_title
+    ON watched_elsewhere(title COLLATE NOCASE);
+CREATE INDEX IF NOT EXISTS idx_watched_elsewhere_imdb
+    ON watched_elsewhere(imdb_id);
 """
 
 # created after the migration, so it can rely on the newer columns
@@ -288,6 +317,13 @@ class Database:
                         "UPDATE media SET from_provider = 1 "
                         "WHERE imdb_id IS NOT NULL AND imdb_id != ''"
                     )
+        elsewhere_cols = {
+            r["name"] for r in self.conn.execute(
+                "PRAGMA table_info(watched_elsewhere)")
+        }
+        if "my_rating" not in elsewhere_cols:
+            self.conn.execute(
+                "ALTER TABLE watched_elsewhere ADD COLUMN my_rating INTEGER")
         cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(episodes)")}
         for name, decl in (
             ("watched", "INTEGER NOT NULL DEFAULT 0"),
@@ -683,6 +719,153 @@ class Database:
                     int(bool(profile.get("not_found"))), time.time(),
                 ),
             )
+
+    @staticmethod
+    def _decode_elsewhere_item(row: sqlite3.Row) -> dict:
+        item = dict(row)
+        for field in ("genres", "cast_list"):
+            try:
+                value = json.loads(item[field] or "[]")
+            except (TypeError, ValueError):
+                value = []
+            item[field] = value if isinstance(value, list) else []
+        item["source"] = "elsewhere"
+        return item
+
+    def add_watched_elsewhere(self, item: dict) -> int:
+        """Save provider metadata without creating or changing a local media row."""
+        title = str(item.get("title") or "").strip()
+        media_type = str(item.get("media_type") or "").strip().lower()
+        provider = str(item.get("provider") or "").strip()
+        if not title:
+            raise ValueError("a title is required")
+        if media_type not in ("movie", "series"):
+            raise ValueError("media_type must be 'movie' or 'series'")
+        if not provider:
+            raise ValueError("a metadata provider is required")
+
+        imdb_id = str(item.get("imdb_id") or "").strip() or None
+        provider_id = str(item.get("provider_id") or imdb_id or "").strip()
+        if not provider_id:
+            year = item.get("year")
+            provider_id = f"{title.casefold()}|{year or ''}"
+        source_key = f"{provider.casefold()}|{media_type}|{provider_id.casefold()}"
+        def encoded(value) -> str | None:
+            if not isinstance(value, list) or not value:
+                return None
+            return json.dumps(value, ensure_ascii=False)
+        now = time.time()
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO watched_elsewhere (
+                    provider, provider_id, source_key, imdb_id, title, media_type,
+                    year, plot, genres, rating, my_rating, runtime, director, writer,
+                    cast_list, country, release_date, poster_path, poster2_path,
+                    added_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(source_key) DO UPDATE SET
+                    imdb_id=COALESCE(excluded.imdb_id, watched_elsewhere.imdb_id),
+                    title=excluded.title,
+                    year=COALESCE(excluded.year, watched_elsewhere.year),
+                    plot=COALESCE(excluded.plot, watched_elsewhere.plot),
+                    genres=COALESCE(excluded.genres, watched_elsewhere.genres),
+                    rating=COALESCE(excluded.rating, watched_elsewhere.rating),
+                    my_rating=COALESCE(excluded.my_rating, watched_elsewhere.my_rating),
+                    runtime=COALESCE(excluded.runtime, watched_elsewhere.runtime),
+                    director=COALESCE(excluded.director, watched_elsewhere.director),
+                    writer=COALESCE(excluded.writer, watched_elsewhere.writer),
+                    cast_list=COALESCE(excluded.cast_list, watched_elsewhere.cast_list),
+                    country=COALESCE(excluded.country, watched_elsewhere.country),
+                    release_date=COALESCE(excluded.release_date, watched_elsewhere.release_date),
+                    poster_path=COALESCE(excluded.poster_path, watched_elsewhere.poster_path),
+                    poster2_path=COALESCE(excluded.poster2_path, watched_elsewhere.poster2_path)
+                """,
+                (
+                    provider, provider_id, source_key, imdb_id, title, media_type,
+                    item.get("year"), item.get("plot"),
+                    encoded(item.get("genres")), item.get("rating"),
+                    item.get("my_rating"),
+                    item.get("runtime"), item.get("director"), item.get("writer"),
+                    encoded(item.get("cast_list") or item.get("cast")),
+                    item.get("country"), item.get("release_date"),
+                    item.get("poster_path"), item.get("poster2_path"), now,
+                ),
+            )
+        row = self.conn.execute(
+            "SELECT id FROM watched_elsewhere WHERE source_key=?", (source_key,)
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("saved watched-elsewhere title could not be read back")
+        return int(row["id"])
+
+    def get_watched_elsewhere(self, item_id: int) -> dict | None:
+        row = self.conn.execute(
+            "SELECT * FROM watched_elsewhere WHERE id=?", (item_id,)
+        ).fetchone()
+        return self._decode_elsewhere_item(row) if row else None
+
+    def list_watched_elsewhere(self) -> list[dict]:
+        rows = self.conn.execute(
+            "SELECT * FROM watched_elsewhere "
+            "ORDER BY added_at DESC, title COLLATE NOCASE"
+        ).fetchall()
+        return [self._decode_elsewhere_item(row) for row in rows]
+
+    def set_watched_elsewhere(self, item_id: int, watched: bool) -> bool:
+        with self.conn:
+            cursor = self.conn.execute(
+                "UPDATE watched_elsewhere SET watched=?, last_watched=? WHERE id=?",
+                (int(watched), time.time() if watched else None, item_id),
+            )
+        return cursor.rowcount > 0
+
+    def set_watched_elsewhere_my_rating(
+        self, item_id: int, rating: int | None,
+    ) -> bool:
+        """Set a saved external title's personal rating (None clears it)."""
+        value = None if rating is None else max(1, min(5, rating))
+        with self.conn:
+            cursor = self.conn.execute(
+                "UPDATE watched_elsewhere SET my_rating=? WHERE id=?",
+                (value, item_id),
+            )
+        return cursor.rowcount > 0
+
+    def delete_watched_elsewhere(self, item_id: int) -> bool:
+        with self.conn:
+            cursor = self.conn.execute(
+                "DELETE FROM watched_elsewhere WHERE id=?", (item_id,))
+        return cursor.rowcount > 0
+
+    def find_watched_elsewhere_local_matches(self, item_id: int) -> list[dict]:
+        """Suggest exact-ID matches, then exact title/year matches, without linking."""
+        item = self.get_watched_elsewhere(item_id)
+        if item is None:
+            return []
+        return self.find_local_matches(item)
+
+    def find_local_matches(self, item: dict) -> list[dict]:
+        """Find likely local copies without changing either record."""
+        imdb_id = item.get("imdb_id")
+        if imdb_id:
+            rows = self.conn.execute(
+                "SELECT id, title, year, media_type, imdb_id, path FROM media "
+                "WHERE media_type=? AND imdb_id=? ORDER BY title COLLATE NOCASE",
+                (item.get("media_type"), imdb_id),
+            ).fetchall()
+            if rows:
+                return [dict(row) for row in rows]
+        if item.get("year") is None or not item.get("title"):
+            return []
+        rows = self.conn.execute(
+            "SELECT id, title, year, media_type, imdb_id, path FROM media "
+            "WHERE media_type=? AND year=? AND title COLLATE NOCASE=? "
+            "ORDER BY title COLLATE NOCASE",
+            (item.get("media_type"), item["year"], item["title"]),
+        ).fetchall()
+        return [dict(row) for row in rows]
 
     def duplicates(self) -> list[dict]:
         """Return groups of items that share the same title (case-insensitive)."""

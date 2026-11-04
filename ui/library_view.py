@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 import tkinter as tk
 import webbrowser
 from tkinter import font as tkfont
@@ -41,6 +42,11 @@ def calculate_grid_layout(width: int) -> tuple[int, int]:
     return cols, card_width
 
 
+def should_ignore_click_after_resize(resized_at: float | None, now: float) -> bool:
+    """Ignore clicks that can leak through a native maximize/restore action."""
+    return resized_at is not None and 0 <= now - resized_at < 0.5
+
+
 class LibraryView(tk.Frame):
     """Scrollable poster grid drawn directly on the canvas.
 
@@ -55,11 +61,13 @@ class LibraryView(tk.Frame):
         images: ImageCache,
         on_open: Callable[[dict], None],
         on_context: Callable[[dict, int, int], None] | None = None,
+        on_profile_close: Callable[[], None] | None = None,
     ) -> None:
         super().__init__(master, bg=BG)
         self._images = images
         self._on_open = on_open
         self._on_context = on_context
+        self._on_profile_close = on_profile_close
         self._items: list[dict] = []
         self._selected: set[int] = set()
         self._anchor: int | None = None
@@ -84,6 +92,12 @@ class LibraryView(tk.Frame):
         self._empty_button: str | None = None
         self._empty_command = None
         self._layout_job: str | None = None
+        self._toplevel = self.winfo_toplevel()
+        self._window_size: tuple[int, int] | None = None
+        self._window_resized_at: float | None = None
+        self._window_configure_id = self._toplevel.bind(
+            "<Configure>", self._on_toplevel_configure, add="+",
+        )
         self._focus_idx: int | None = None
         self._title_font = tkfont.Font(family="Segoe UI Semibold", size=10)
         self._meta_font = tkfont.Font(family="Segoe UI", size=8)
@@ -142,7 +156,8 @@ class LibraryView(tk.Frame):
         )
         self._profile_wiki.pack(side="left")
         tk.Button(
-            profile_actions, text="Close", command=self.hide_person_profile,
+            profile_actions, text="Close",
+            command=self._on_profile_close or self.hide_person_profile,
             bg="#1a2130", fg=TEXT, activebackground="#243046",
             activeforeground=TEXT, bd=0, padx=10, pady=6, cursor="hand2",
         ).pack(side="right")
@@ -189,6 +204,20 @@ class LibraryView(tk.Frame):
             unbind_bindall(self, "<MouseWheel>", getattr(self, "_wheel_id", None))
         except Exception:
             log.debug("could not drop the wheel binding", exc_info=True)
+        if self._window_configure_id:
+            try:
+                self._toplevel.unbind("<Configure>", self._window_configure_id)
+            except tk.TclError:
+                log.debug("could not drop the window configure binding", exc_info=True)
+            self._window_configure_id = None
+
+    def _on_toplevel_configure(self, event) -> None:
+        if event.widget is not self._toplevel:
+            return
+        size = (event.width, event.height)
+        if self._window_size is not None and size != self._window_size:
+            self._window_resized_at = time.monotonic()
+        self._window_size = size
 
     # --- public API ---------------------------------------------------
 
@@ -436,6 +465,10 @@ class LibraryView(tk.Frame):
         self.canvas.focus_set()
         item = self._item_at(event)
         if item is None:
+            return
+        if should_ignore_click_after_resize(
+            self._window_resized_at, time.monotonic(),
+        ):
             return
         index = self._items.index(item)
         ctrl = bool(event.state & 0x4)

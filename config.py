@@ -17,6 +17,7 @@ APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"
 THUMB_CACHE_DIR = DATA_DIR / "thumbs"
 PEOPLE_CACHE_DIR = DATA_DIR / "people"
+WATCHED_ELSEWHERE_DIR = DATA_DIR / "watched_elsewhere"
 LOG_DIR = DATA_DIR / "logs"
 DB_PATH = DATA_DIR / "library.db"
 PLACEHOLDER_PATH = APP_DIR / "assets" / "placeholder.png"
@@ -112,13 +113,19 @@ def backup_library(destination: str | Path) -> tuple[bool, str]:
                 destination.close()
                 source.close()
             shutil.copy2(SETTINGS_PATH, stage / "settings.json")
-            for name, directory in (("thumbs", THUMB_CACHE_DIR), ("people", PEOPLE_CACHE_DIR)):
+            for name, directory in (
+                ("thumbs", THUMB_CACHE_DIR),
+                ("people", PEOPLE_CACHE_DIR),
+                ("watched_elsewhere", WATCHED_ELSEWHERE_DIR),
+            ):
                 if directory.exists():
                     shutil.copytree(directory, stage / name, dirs_exist_ok=True)
 
             with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-                for path in sorted(stage.iterdir()):
-                    archive.write(path, arcname=path.name)
+                for path in sorted(stage.rglob("*")):
+                    if path.is_file():
+                        archive.write(
+                            path, arcname=path.relative_to(stage).as_posix())
     except (OSError, sqlite3.Error, zipfile.BadZipFile) as exc:
         log.exception("could not create library backup")
         return False, f"The backup could not be created: {exc}"
@@ -149,7 +156,7 @@ def _stage_backup(archive: zipfile.ZipFile, stage: Path) -> tuple[Path, Path, di
                 raise ValueError(f"Unexpected or duplicate backup member: {name}")
             target = stage / member.parts[0]
             members[name] = target
-        elif member.parts[0] in ("thumbs", "people") and len(member.parts) > 1:
+        elif member.parts[0] in ("thumbs", "people", "watched_elsewhere") and len(member.parts) > 1:
             target = stage.joinpath(*member.parts)
             members[name] = target
         else:
@@ -274,7 +281,11 @@ def restore_library_backup(path: str | Path) -> tuple[bool, str]:
                     raise
 
                 cache_warning = ""
-                for name, directory in (("thumbs", THUMB_CACHE_DIR), ("people", PEOPLE_CACHE_DIR)):
+                for name, directory in (
+                    ("thumbs", THUMB_CACHE_DIR),
+                    ("people", PEOPLE_CACHE_DIR),
+                    ("watched_elsewhere", WATCHED_ELSEWHERE_DIR),
+                ):
                     source = Path(tmp_dir) / name
                     if source.exists():
                         try:
@@ -295,7 +306,10 @@ def restore_library_backup(path: str | Path) -> tuple[bool, str]:
 
 def init() -> None:
     global MOVIES_DIR, SERIES_DIR, ORGANIZER_DIR
-    for d in (DATA_DIR, THUMB_CACHE_DIR, PEOPLE_CACHE_DIR, LOG_DIR):
+    for d in (
+        DATA_DIR, THUMB_CACHE_DIR, PEOPLE_CACHE_DIR,
+        WATCHED_ELSEWHERE_DIR, LOG_DIR,
+    ):
         try:
             d.mkdir(parents=True, exist_ok=True)
         except OSError:

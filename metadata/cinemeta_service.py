@@ -199,6 +199,8 @@ def _to_result(meta: dict, media_type: str) -> MetadataResult:
         backdrop_url=art("background"),
         seasons=seasons,
         provider="Cinemeta",
+        provider_id=str(meta.get("id") or "") or None,
+        media_type=media_type,
     )
 
 

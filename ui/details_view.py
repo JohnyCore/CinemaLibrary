@@ -52,7 +52,8 @@ class DetailsView(tk.Frame):
     def __init__(self, master, images: ImageCache, on_back, db: Database,
                   on_fetched=None, on_filter=None,
                   post: Callable[[Callable[[], None]], None] | None = None,
-                  on_person=None) -> None:
+                  on_person=None, on_elsewhere_save=None,
+                  on_elsewhere_watched=None, on_open_local_match=None) -> None:
         super().__init__(master, bg=BG)
         self._images = images
         self._on_back = on_back
@@ -60,6 +61,9 @@ class DetailsView(tk.Frame):
         self._on_fetched = on_fetched
         self._on_filter = on_filter
         self._on_person = on_person
+        self._on_elsewhere_save = on_elsewhere_save
+        self._on_elsewhere_watched = on_elsewhere_watched
+        self._on_open_local_match = on_open_local_match
         self._post = post or (lambda fn: self.after(0, fn))
         self._item: dict | None = None
         self._bg_job: ImageJob | None = None
@@ -139,7 +143,12 @@ class DetailsView(tk.Frame):
         new plot, new names. Marking an item watched or rating it does
         not change the signature, so those stay in place.
         """
-        return (item.get("poster_path"), item.get("poster2_path"),
+        local_matches = tuple(
+            (match.get("id"), match.get("title"), match.get("year"))
+            for match in item.get("local_matches") or []
+        )
+        return (item.get("source"), item.get("provider_id"), local_matches,
+                item.get("poster_path"), item.get("poster2_path"),
                 item.get("plot"), item.get("director"), item.get("writer"),
                 item.get("cast_list"), item.get("country"), item.get("genres"),
                 item.get("imdb_id"), item.get("rating"), item.get("runtime"),
@@ -152,13 +161,18 @@ class DetailsView(tk.Frame):
         Re-showing the *same* item - after a fetch, a watched toggle - only
         updates the values in place. A different item rebuilds the panel.
         """
-        same_item = self._panel_item_id == item.get("id")
-        if (same_item and self._panel
+        same_identity = (
+            self._panel_item_id == item.get("id")
+            and self._panel_signature is not None
+            and self._panel_signature[0] == item.get("source")
+        )
+        if (same_identity and self._panel
                 and self._panel_signature == self._signature(item)):
             self._item = item
             self._update_panel(item)
             return
 
+        same_item = same_identity and item.get("source") != "elsewhere"
         self._item = item
         self._poster_id = None
         self._cancel_jobs()
@@ -240,7 +254,7 @@ class DetailsView(tk.Frame):
         self._stacked(overview, item)
         self._facts(overview, item)
         overview.pack(fill="x")
-        if is_series:
+        if is_series and item.get("source") != "elsewhere":
             # the whole body shares the one scroll: the meta is the first
             # thing the page shows, the episodes follow under it
             tk.Frame(inner, height=1, bg=BORDER).pack(fill="x", pady=(12, 0))
@@ -254,7 +268,8 @@ class DetailsView(tk.Frame):
         if upper_only:
             return
         self._actions(self._actions_frame, item)
-        self._location_row(self._loc_frame, item)
+        if item.get("source") != "elsewhere":
+            self._location_row(self._loc_frame, item)
 
     def _fill_genres(self, bar: tk.Frame, item: dict) -> None:
         """Fill the genre links; the bar is packed after its children."""
@@ -522,6 +537,15 @@ class DetailsView(tk.Frame):
             return
         current = item.get("my_rating")
         value = None if current == rating else rating
+        if item.get("source") == "elsewhere":
+            if item.get("catalog_saved") and not self._db.set_watched_elsewhere_my_rating(
+                int(item["id"]), value,
+            ):
+                self._set_status("That saved title no longer exists.")
+                return
+            item["my_rating"] = value
+            self._update_stars(value)
+            return
         self._db.set_my_rating(item["id"], value)
         item["my_rating"] = value
         self._update_stars(value)
@@ -642,6 +666,47 @@ class DetailsView(tk.Frame):
         tk.Frame(inner, height=1, bg=BORDER).pack(fill="x", pady=(0, 12))
         bar = tk.Frame(inner, bg=PANEL_BG)
         bar.pack(anchor="w", pady=(14, 0))
+        if item.get("source") == "elsewhere":
+            saved = bool(item.get("catalog_saved"))
+            if saved:
+                watched = bool(item.get("watched"))
+                button = tk.Button(
+                    bar,
+                    text="Mark as Unwatched" if watched else "Mark as Watched",
+                    command=self._toggle_watched, **BTN,
+                )
+                button.pack(side="left", padx=(0, 10))
+                self._panel["watched"] = button
+            else:
+                tk.Button(
+                    bar, text="Save to Watched Elsewhere",
+                    command=self._save_elsewhere, **BTN,
+                ).pack(side="left", padx=(0, 10))
+            self._action_status = tk.Label(
+                inner, bg=PANEL_BG, fg=MUTED, font=("Segoe UI", 9),
+                anchor="w", justify="left",
+            )
+            self._action_status.pack(anchor="w", pady=(8, 0))
+            matches = item.get("local_matches") or []
+            if matches:
+                tk.Label(
+                    inner, text="Possible local copy", bg=PANEL_BG, fg=MUTED,
+                    font=("Segoe UI Semibold", 9),
+                ).pack(anchor="w", pady=(12, 4))
+                for match in matches:
+                    label = f"{match.get('title') or 'Untitled'}"
+                    if match.get("year"):
+                        label += f" ({match['year']})"
+                    tk.Button(
+                        inner, text=f"Open local title: {label}",
+                        command=lambda m=match: self._open_local_match(m),
+                        **BTN,
+                    ).pack(anchor="w", pady=(0, 4))
+                tk.Label(
+                    inner, text="These records remain separate; nothing is merged.",
+                    bg=PANEL_BG, fg=MUTED, font=("Segoe UI", 8),
+                ).pack(anchor="w", pady=(0, 4))
+            return
         if item.get("video_path") and Path(item["video_path"]).is_file():
             tk.Button(bar, text="Play", command=self._play_video, **BTN).pack(
                 side="left", padx=(0, 10))
@@ -676,8 +741,47 @@ class DetailsView(tk.Frame):
         item = self._item
         if not item:
             return
+        if item.get("source") == "elsewhere":
+            watched = not bool(item.get("watched"))
+            if not self._db.set_watched_elsewhere(item["id"], watched):
+                self._set_status("This saved title no longer exists.")
+                return
+            fresh = self._db.get_watched_elsewhere(item["id"])
+            if fresh is None:
+                self._set_status("This saved title no longer exists.")
+                return
+            fresh["catalog_saved"] = True
+            fresh["local_matches"] = self._db.find_watched_elsewhere_local_matches(
+                fresh["id"])
+            self.show(fresh)
+            self._set_status(
+                "Marked as watched." if watched else "Marked as unwatched.", ok=True)
+            if self._on_elsewhere_watched is not None:
+                self._on_elsewhere_watched()
+            return
         self._db.set_media_watched(item["id"], not bool(item.get("watched")))
         self._notify_fetched(item["id"])
+
+    def _save_elsewhere(self) -> None:
+        item = self._item
+        if item is None or self._on_elsewhere_save is None:
+            return
+        try:
+            saved = self._on_elsewhere_save(item)
+        except Exception as exc:
+            log.exception("could not save watched-elsewhere title %s",
+                          item.get("title"))
+            self._set_status(f"Could not save this title: {exc}")
+            return
+        if saved is None:
+            self._set_status("Could not save this title.")
+            return
+        self.show(saved)
+        self._set_status("Saved for offline access.", ok=True)
+
+    def _open_local_match(self, item: dict) -> None:
+        if self._on_open_local_match is not None:
+            self._on_open_local_match(item)
 
     # --- metadata fetch -----------------------------------------------
 
