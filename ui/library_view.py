@@ -33,6 +33,14 @@ TEXT_WIDTH = CARD_W - 12
 log = logging.getLogger(__name__)
 
 
+def calculate_grid_layout(width: int) -> tuple[int, int]:
+    """Choose a column count near the default card width, then fill the row."""
+    available = max(1, width - 2 * PAD)
+    cols = max(1, (2 * (available + GAP_X) + COL_STEP) // (2 * COL_STEP))
+    card_width = max(1, (available - (cols - 1) * GAP_X) // cols)
+    return cols, card_width
+
+
 class LibraryView(tk.Frame):
     """Scrollable poster grid drawn directly on the canvas.
 
@@ -58,6 +66,12 @@ class LibraryView(tk.Frame):
         self._rendered: dict[tuple[int, int], list[int]] = {}
         self._rendered_items: dict[tuple[int, int], dict] = {}
         self._img_ids: dict[tuple[int, int], int] = {}
+        self._card_w = CARD_W
+        self._poster_w = POSTER_W
+        self._poster_h = POSTER_H
+        self._card_h = CARD_H
+        self._row_h = ROW_H
+        self._text_width = TEXT_WIDTH
         # the picture a card shows: the card holds it, so the Tk image
         # survives the cache that handed it out
         self._photos: dict[tuple[int, int], object] = {}
@@ -342,12 +356,22 @@ class LibraryView(tk.Frame):
         width = self.canvas.winfo_width()
         if width < 50:
             return
-        cols = max(1, (width - 2 * PAD + GAP_X) // COL_STEP)
-        if cols != self._cols:
+        cols, card_width = calculate_grid_layout(width)
+        poster_width = max(1, card_width - 2)
+        poster_height = round(poster_width * POSTER_H / POSTER_W)
+        card_height = poster_height + CARD_H - POSTER_H
+        if (cols, card_width) != (self._cols, self._card_w):
             self._cols = cols
+            self._card_w = card_width
+            self._poster_w = poster_width
+            self._poster_h = poster_height
+            self._card_h = card_height
+            self._row_h = card_height + GAP_Y
+            self._text_width = card_width - 12
+            self._fit_cache.clear()
             self._delete_all_cells()
         self._rows = max(1, (len(self._items) + cols - 1) // cols)
-        self.canvas.configure(scrollregion=(0, 0, 1, PAD + self._rows * ROW_H + PAD))
+        self.canvas.configure(scrollregion=(0, 0, 1, PAD + self._rows * self._row_h + PAD))
         self.canvas.configure(cursor="hand2" if self._items else "")
         self._update_empty()
         self._sync_cells()
@@ -493,13 +517,15 @@ class LibraryView(tk.Frame):
         row = index // self._cols
         top = self.canvas.canvasy(0)
         height = self.canvas.winfo_height() or 600
-        y0 = PAD + row * ROW_H
-        y1 = y0 + CARD_H
+        y0 = PAD + row * self._row_h
+        y1 = y0 + self._card_h
         if y0 < top:
-            self.canvas.yview_moveto(max(0.0, (y0 - PAD) / (PAD + self._rows * ROW_H + PAD)))
+            self.canvas.yview_moveto(
+                max(0.0, (y0 - PAD) / (PAD + self._rows * self._row_h + PAD))
+            )
         elif y1 > top + height:
             self.canvas.yview_moveto(
-                max(0.0, (y1 - height) / (PAD + self._rows * ROW_H + PAD))
+                max(0.0, (y1 - height) / (PAD + self._rows * self._row_h + PAD))
             )
         self.after_idle(self._sync_cells)
 
@@ -516,7 +542,7 @@ class LibraryView(tk.Frame):
         cached = self._fit_cache.get(title)
         if cached is not None:
             return cached
-        limit = 2 * TEXT_WIDTH
+        limit = 2 * self._text_width
         if self._title_font.measure(title) <= limit:
             self._remember_fit(title, title)
             return title
@@ -568,8 +594,8 @@ class LibraryView(tk.Frame):
             return
         viewport = self.canvas.winfo_height() or 600
         top = self.canvas.canvasy(0)
-        row_first = int(top // ROW_H)
-        row_last = int((top + viewport) // ROW_H)
+        row_first = int(top // self._row_h)
+        row_last = int((top + viewport) // self._row_h)
         lo = max(0, row_first - 1)
         hi = min(self._rows, row_last + 2)
         keep: set[tuple[int, int]] = set()
@@ -591,10 +617,10 @@ class LibraryView(tk.Frame):
 
     def _draw(self, pos: tuple[int, int], item: dict, priority: int) -> None:
         r, c = pos
-        x0 = PAD + c * COL_STEP
-        y0 = PAD + r * ROW_H
-        x1 = x0 + CARD_W
-        y1 = y0 + CARD_H
+        x0 = PAD + c * (self._card_w + GAP_X)
+        y0 = PAD + r * self._row_h
+        x1 = x0 + self._card_w
+        y1 = y0 + self._card_h
         idx = r * self._cols + c
         tag = f"c:{idx}"
         focused = self._focus_idx == idx
@@ -613,8 +639,8 @@ class LibraryView(tk.Frame):
         self._tokens[pos] = token
         title = self._fit_title(item.get("title") or "Untitled")
         ids.append(self.canvas.create_text(
-            (x0 + x1) // 2, y0 + POSTER_H + 7, text=title, anchor="n",
-            width=TEXT_WIDTH, justify="center", fill=TEXT, font=self._title_font,
+            (x0 + x1) // 2, y0 + self._poster_h + 7, text=title, anchor="n",
+            width=self._text_width, justify="center", fill=TEXT, font=self._title_font,
             tags=tag,
         ))
         year = item.get("year")
@@ -666,7 +692,7 @@ class LibraryView(tk.Frame):
         # the cache hands out the "No poster" artwork until the real
         # picture arrives - and keeps it when there is no poster at all
         self._jobs[pos] = self._images.get_thumbnail(
-            src, (POSTER_W, POSTER_H), deliver, priority=priority
+            src, (self._poster_w, self._poster_h), deliver, priority=priority
         )
 
     def _apply_image(self, pos: tuple[int, int], token: int, image) -> None:
