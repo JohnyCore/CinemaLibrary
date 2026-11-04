@@ -11,9 +11,11 @@ import sqlite3
 import shutil
 import sys
 import tempfile
+import threading
 import time
 import tkinter as tk
 from pathlib import Path
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -690,6 +692,7 @@ def ui_checks(target: Path) -> None:
     db = Database(target / "library.db")
 
     from ui.main_window import MainWindow
+    from ui import settings_view
     app = MainWindow(root, db, movies_dir=target / "Movies", series_dir=target / "Series")
 
     results: list[str] = []
@@ -881,6 +884,16 @@ def ui_checks(target: Path) -> None:
             root.update()
             app._settings._select_tab("deeper")
             root.update()
+            check("Dig Deeper status has its own row above the controls",
+                  app._settings._deeper_status.master
+                  is not app._settings._deeper_scan_btn.master)
+            deeper_result = {**movie, "true_story_article": "Test Movie 0 (film)"}
+            app._settings._deeper_finished(1, 1, 1, False, [deeper_result])
+            root.update()
+            check("the Dig Deeper completion names the new title",
+                  movie["title"] in app._settings._deeper_status.cget("text")
+                  and "Test Movie 0 (film)"
+                  in app._settings._deeper_status.cget("text"))
             rows = app._settings._deeper_tree.get_children()
             check("the true-story list holds the flagged item",
                   movie["id"] in [int(r) for r in rows])
@@ -907,6 +920,10 @@ def ui_checks(target: Path) -> None:
                 "people": [["A Director", "A_Director"]],
                 "awards": [["An Award", "An_Award"]],
             })
+            app._settings._stories_cached(1, 1, [movie])
+            root.update()
+            check("the Dig Deeper cache completion names the cached title",
+                  movie["title"] in app._settings._deeper_status.cget("text"))
             app._settings._select_tab("deeper")
             root.update()
             app._settings._deeper_tree.selection_set(str(movie["id"]))
@@ -917,6 +934,77 @@ def ui_checks(target: Path) -> None:
                   "What really happened." in pane and "Vienna" in pane)
             check("the pane does not wait for the network",
                   "Looking up" not in pane)
+            app._db.set_story_cache(movie["id"], {})
+            cache_write_attempted = threading.Event()
+            original_cache_writer = app._db.set_story_cache
+            original_stories = settings_view.true_story.stories
+
+            def fail_story_cache(media_id, story):
+                cache_write_attempted.set()
+                raise RuntimeError("simulated cache write failure")
+
+            settings_view.true_story.stories = lambda items: {
+                item["id"]: {"real": "Retry story."} for item in items}
+            app._db.set_story_cache = fail_story_cache
+            try:
+                app._settings._cache_stories()
+                check("the story cache worker reaches the failing write",
+                      cache_write_attempted.wait(5))
+                for _ in range(20):
+                    root.update()
+                    time.sleep(0.01)
+                check("a failed story cache can be retried",
+                      str(app._settings._deeper_cache_btn.cget("state")) == "normal"
+                      and "failed" in app._settings._deeper_status.cget("text").lower())
+                if str(app._settings._deeper_cache_btn.cget("state")) == "normal":
+                    app._db.set_story_cache = original_cache_writer
+                    app._settings._cache_stories()
+                    for _ in range(60):
+                        root.update()
+                        if not app._settings._deeper_running:
+                            break
+                        time.sleep(0.05)
+                    check("retrying the story cache succeeds",
+                          app._db.story_cache(movie["id"]).get("real")
+                          == "Retry story."
+                          and str(app._settings._deeper_cache_btn.cget("state"))
+                          == "normal")
+            finally:
+                app._db.set_story_cache = original_cache_writer
+                settings_view.true_story.stories = original_stories
+                app._settings._deeper_running = False
+                app._settings._deeper_cache_btn.configure(state="normal")
+                app._settings._deeper_stop_btn.configure(state="disabled")
+                app._settings._deeper_progress.pack_forget()
+            popup = {}
+            original_popup = settings_view.PopupMenu
+            settings_view.PopupMenu = (
+                lambda _master, _x, _y, entries: popup.update(entries=entries))
+            try:
+                row = app._settings._deeper_tree.bbox(str(movie["id"]))
+                app._settings._deeper_menu(SimpleNamespace(
+                    y=row[1] + row[3] // 2, x_root=0, y_root=0))
+                actions = {label: command for label, command in popup["entries"]
+                           if label}
+                check("the Dig Deeper menu can forget a story",
+                      "Forget this story" in actions)
+                if "Forget this story" in actions:
+                    actions["Forget this story"]()
+                forgotten = app._db.get(movie["id"]) or {}
+                check("forgetting a story allows another scan",
+                      forgotten["true_story"] is None
+                      and not app._db.story_cache(movie["id"])
+                      and any(item["id"] == movie["id"]
+                              for item in app._db.unchecked_items()))
+            finally:
+                settings_view.PopupMenu = original_popup
+            app._db.set_true_story(movie["id"], True, "Test Movie 0 (film)")
+            app._settings._refresh_deeper_list(force=True)
+            app._settings._deeper_drop_verdict(movie["id"])
+            check("Not a True Story remains eligible for a later scan",
+                  (app._db.get(movie["id"]) or {}).get("true_story") is None
+                  and any(item["id"] == movie["id"]
+                          for item in app._db.unchecked_items()))
 
             # a flagged title with no article says so, instead of asking to cache
             app._db.set_true_story(movie["id"], True, "")
@@ -1187,11 +1275,19 @@ def ui_checks(target: Path) -> None:
             # the wikiquote tab
             app._settings._select_tab("quotes")
             root.update()
+            check("Wikiquote status has its own row above the controls",
+                  app._settings._quote_status.master
+                  is not app._settings._quote_scan_btn.master)
             check("the wikiquote tab is there",
                   find_button(app._settings, "Fetch quotes") is not None)
             app._db.set_quotes(movie["id"], [{"text": "A quote", "speaker": "X"}])
             app._settings._refresh_quote_list()
+            app._settings._quotes_finished(1, 1, [(movie, "A quote")])
             root.update()
+            check("the Wikiquote completion names the title and quote",
+                  movie["title"] in app._settings._quote_status.cget("text")
+                  and "Movie" in app._settings._quote_status.cget("text")
+                  and "A quote" in app._settings._quote_status.cget("text"))
             check("the wikiquote list holds the film",
                   len(app._settings._quote_tree.get_children()) == 1)
             app._settings._quote_tree.selection_set(str(movie["id"]))
@@ -1199,6 +1295,26 @@ def ui_checks(target: Path) -> None:
             root.update()
             check("the quote is shown in the pane",
                   "A quote" in app._settings._quote_text.get("1.0", "end"))
+            popup = {}
+            original_popup = settings_view.PopupMenu
+            settings_view.PopupMenu = (
+                lambda _master, _x, _y, entries: popup.update(entries=entries))
+            try:
+                row = app._settings._quote_tree.bbox(str(movie["id"]))
+                app._settings._quote_menu(SimpleNamespace(
+                    y=row[1] + row[3] // 2, x_root=0, y_root=0))
+                actions = {label: command for label, command in popup["entries"]
+                           if label}
+                check("the Wikiquote menu can forget quotes",
+                      "Forget quotes" in actions)
+                if "Forget quotes" in actions:
+                    actions["Forget quotes"]()
+                check("forgetting quotes allows another fetch",
+                      app._db.get(movie["id"])["quotes"] is None
+                      and any(item["id"] == movie["id"]
+                              for item in app._db.unchecked_quote_items()))
+            finally:
+                settings_view.PopupMenu = original_popup
             app._show_library()
             root.update()
             stats_snapshot = app._images.snapshot_stats()

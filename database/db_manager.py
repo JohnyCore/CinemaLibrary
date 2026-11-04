@@ -839,6 +839,13 @@ class Database:
             self.conn.execute(
                 "UPDATE media SET true_story=NULL, true_story_article=NULL")
 
+    def forget_true_story(self, media_id: int) -> None:
+        """Forget one verdict and its cached story so it can be checked again."""
+        with self.conn:
+            self.conn.execute(
+                "UPDATE media SET true_story=NULL, true_story_article=NULL, "
+                "story_cache=NULL WHERE id=?", (media_id,))
+
     # --- personal rating -----------------------------------------------
 
     def set_my_rating(self, media_id: int, rating: int | None) -> None:
@@ -856,6 +863,11 @@ class Database:
             self.conn.execute(
                 "UPDATE media SET quotes=? WHERE id=?",
                 (json.dumps(quotes, ensure_ascii=False), media_id))
+
+    def forget_quotes(self, media_id: int) -> None:
+        """Forget a film's quotes so it can be looked up again."""
+        with self.conn:
+            self.conn.execute("UPDATE media SET quotes=NULL WHERE id=?", (media_id,))
 
     def quote_items(self) -> list[dict]:
         """The films that have quotes."""

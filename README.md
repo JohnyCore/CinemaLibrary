@@ -318,7 +318,9 @@ story is based on a true story, and lets you read about each of them.
   titles are asked for in one request, so a whole library takes a couple of
   minutes. The status line shows what it is doing — *Checking 250 of 427 —
   Some Movie (2019) (movie) · 177 to go* — and **Stop** ends the run
-  without losing the verdicts already found.
+  without losing the verdicts already found. When the scan ends, it names
+  up to three flagged titles and their Wikipedia articles; any others are
+  in the list.
 * The list holds the flagged titles — pick one to read it. The pane shows
   **What really happened** (the lead of the book, the article or the person
   the film was made from, with the link to it), **Where it was filmed**,
@@ -331,13 +333,18 @@ story is based on a true story, and lets you read about each of them.
   well under a minute. After that the pane is filled from the database and
   the app needs **no network at all** to read the stories. A title that was
   not cached yet is fetched once in the background when you pick it, and
-  kept for the next time.
+  kept for the next time. The status line names the titles whose stories
+  were cached (up to three; any others are in the list).
 * The categories are Wikipedia's own, so a film nobody tagged that way is
   not on the list, and a film Wikipedia tags loosely (a historical epic with
   a fictional story, say) is. Only titles that were checked are skipped by
   the next scan.
 * **Forget flags** clears every verdict, so the next scan checks the whole
-  library again.
+  library again. Right-click a title and choose **Forget this story** to
+  clear just that title's verdict and cached story, so the next scan checks
+  it again. **Not a True Story** also dismisses that title and makes it
+  eligible for the next scan, so it can return if a later lookup finds a
+  true-story match.
 
 The scan needs the network; without it the tab says so and the items stay
 unchecked for the next try. Once the stories are cached, the tab reads
@@ -350,7 +357,11 @@ without a network.
 six films per request, so the whole library takes about seven minutes.
 **Stop** ends the run and keeps what it found. The list on the left holds
 the films that have quotes, the pane on the right shows them with who said
-them, and **Random quote** picks one from the whole library.
+them, and **Random quote** picks one from the whole library. When a fetch
+ends, the status line names up to three films with quotes and shows a sample
+quote for each; any others are in the list.
+Right-click a film in the list and choose **Forget quotes** to remove only
+that film's quotes and make it eligible for another fetch.
 
 Wikimedia throttles apps that ask too much, too fast. When that happens
 the run does not die: it waits (the status says *Wikiquote is throttling us

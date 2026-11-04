@@ -45,6 +45,29 @@ SIDEBAR_BG = "#101319"
 FETCH_WORKERS = 4
 
 
+def _media_result_label(item: dict) -> str:
+    title = str(item.get("title") or "Untitled")
+    year = str(item.get("year") or "").strip()
+    kind = "Series" if item.get("media_type") == "series" else "Movie"
+    return f"{title} ({year}) · {kind}" if year else f"{title} · {kind}"
+
+
+def _quote_result_label(item: dict, quote: str) -> str:
+    preview = str(quote or "").strip()
+    if len(preview) > 100:
+        preview = preview[:97].rstrip() + "…"
+    if preview:
+        return f"{_media_result_label(item)} — “{preview}”"
+    return _media_result_label(item)
+
+
+def _result_summary(labels: list[str]) -> str:
+    shown = labels[:3]
+    if len(labels) > len(shown):
+        shown.append(f"{len(labels) - len(shown)} more in the list")
+    return "; ".join(shown)
+
+
 class SettingsView(tk.Frame):
     """Full-page settings, shown inside the main content area."""
 
@@ -1644,28 +1667,31 @@ class SettingsView(tk.Frame):
         header.pack(fill="x", pady=(0, 12))
 
         self._deeper_status = tk.Label(header, text="", bg=PANEL_BG, fg=MUTED,
-                                       font=("Segoe UI", 9), anchor="w", justify="left")
-        self._deeper_status.pack(side="left", padx=(10, 0))
+                                       font=("Segoe UI", 9), anchor="w", justify="left",
+                                       wraplength=640)
+        self._deeper_status.pack(fill="x", padx=(10, 0), pady=(0, 6))
+        controls = tk.Frame(header, bg=PANEL_BG)
+        controls.pack(fill="x")
 
         btn_style = dict(
             bg=BTN_BG, fg=TEXT, activebackground=BTN_ACTIVE, activeforeground=TEXT,
             bd=0, padx=12, pady=5, font=("Segoe UI", 9), cursor="hand2",
         )
-        tk.Button(header, text="Forget flags", command=self._reset_deeper,
+        tk.Button(controls, text="Forget flags", command=self._reset_deeper,
                   **btn_style).pack(side="right", padx=(8, 0))
         self._deeper_cache_btn = tk.Button(
-            header, text="Cache the stories", command=self._cache_stories,
+            controls, text="Cache the stories", command=self._cache_stories,
             **btn_style)
         self._deeper_cache_btn.pack(side="right", padx=(8, 0))
         self._deeper_stop_btn = tk.Button(
-            header, text="Stop", command=self._cancel_deeper, state="disabled",
+            controls, text="Stop", command=self._cancel_deeper, state="disabled",
             **btn_style, disabledforeground="#5a6472")
         self._deeper_stop_btn.pack(side="right", padx=(8, 0))
         self._deeper_scan_btn = tk.Button(
-            header, text="Scan library", command=self._scan_deeper, **btn_style)
+            controls, text="Scan library", command=self._scan_deeper, **btn_style)
         self._deeper_scan_btn.pack(side="right")
         self._deeper_progress = ttk.Progressbar(
-            header, mode="determinate", length=160,
+            controls, mode="determinate", length=160,
             style="Dark.Horizontal.TProgressbar")
 
         body = tk.Frame(inner, bg=PANEL_BG)
@@ -1828,7 +1854,7 @@ class SettingsView(tk.Frame):
         self._on_open_item(item)
 
     def _deeper_menu(self, event) -> None:
-        """Right-click on a title: open it, or drop a wrong verdict."""
+        """Right-click on a title to open it or manage its verdict."""
         iid = self._deeper_tree.identify_row(event.y)
         if not iid:
             return
@@ -1841,18 +1867,29 @@ class SettingsView(tk.Frame):
         if folder is not None:
             entries.append(("Open Folder", self._open_deeper_folder))
         entries.append((None, None))
+        entries.append(("Forget this story",
+                        lambda: self._deeper_forget_story(item["id"])))
         entries.append(("Not a True Story",
                         lambda: self._deeper_drop_verdict(item["id"])))
         PopupMenu(self, event.x_root, event.y_root, entries)
 
-    def _deeper_drop_verdict(self, media_id: int) -> None:
-        """The verdict was wrong - the title leaves the list for good."""
-        self._db.set_true_story(media_id, False, None)
+    def _deeper_forget_story(self, media_id: int) -> None:
+        """Clear this verdict and cached story so the title can be checked again."""
+        self._db.forget_true_story(media_id)
         self._refresh_deeper_list(force=True)
         if self._on_changed:
             self._on_changed([media_id])
         self._deeper_status.configure(
-            text="Removed the title - a new scan will not flag it again.")
+            text="Forgot the story - this title will be checked on the next scan.")
+
+    def _deeper_drop_verdict(self, media_id: int) -> None:
+        """Dismiss this result and allow a later scan to check it again."""
+        self._db.forget_true_story(media_id)
+        self._refresh_deeper_list(force=True)
+        if self._on_changed:
+            self._on_changed([media_id])
+        self._deeper_status.configure(
+            text="Removed the title - it will be checked on the next scan.")
 
     def _on_deeper_select(self, event=None) -> None:
         """Show the story of the selected title - from the cache."""
@@ -1975,37 +2012,52 @@ class SettingsView(tk.Frame):
 
         def worker() -> None:
             done = 0
+            cached: list[dict] = []
             clock = time.monotonic()
-            for start in range(0, len(todo), 20):
-                if self._deeper_cancel.is_set():
-                    break
-                chunk = todo[start:start + 20]
-                try:
+            error: str | None = None
+            try:
+                for start in range(0, len(todo), 20):
+                    if self._deeper_cancel.is_set():
+                        break
+                    chunk = todo[start:start + 20]
                     stories = true_story.stories(chunk)
-                except Exception as exc:
-                    log.warning("the story lookup failed: %s", exc)
-                    break
-                for item in chunk:
-                    story = stories.get(item["id"])
-                    if story:
-                        self._db.set_story_cache(item["id"], story)
-                done += len(chunk)
-                # wikipedia answers one request at a time, so the elapsed time
-                # is the only honest estimate there is
-                left = (time.monotonic() - clock) / done * (len(todo) - done)
-                self._post(lambda d=done, s=left:
-                           self._deeper_progress_state(d, len(todo), s))
-            self._post(lambda: self._stories_cached(done, len(todo)))
+                    for item in chunk:
+                        story = stories.get(item["id"])
+                        if story:
+                            self._db.set_story_cache(item["id"], story)
+                            if self._db.story_cache(item["id"]):
+                                cached.append(item)
+                    done += len(chunk)
+                    # wikipedia answers one request at a time, so the elapsed time
+                    # is the only honest estimate there is
+                    left = (time.monotonic() - clock) / done * (len(todo) - done)
+                    self._post(lambda d=done, s=left:
+                               self._deeper_progress_state(d, len(todo), s))
+            except Exception as exc:
+                error = str(exc)
+                log.warning("the story caching failed: %s", exc)
+            finally:
+                self._post(lambda d=done, e=error:
+                           self._stories_cached(d, len(todo), cached, e))
 
         threading.Thread(target=self._db.thread_target(worker), daemon=True).start()
 
-    def _stories_cached(self, done: int, total: int) -> None:
+    def _stories_cached(self, done: int, total: int, cached: list[dict],
+                        error: str | None = None) -> None:
         self._deeper_running = False
         self._deeper_cache_btn.configure(state="normal")
         self._deeper_stop_btn.configure(state="disabled")
         self._deeper_progress.pack_forget()
-        self._deeper_status.configure(
-            text=f"Cached {done}/{total} story(ies) - readable without a network.")
+        if error:
+            text = (f"Caching failed after {done}/{total} title(s): {error}. "
+                    "You can retry.")
+        else:
+            text = (f"Checked {done}/{total} title(s) — cached story data for "
+                    f"{len(cached)}.")
+        if cached:
+            text += "\nCached: " + _result_summary(
+                [_media_result_label(item) for item in cached])
+        self._deeper_status.configure(text=text)
 
     def _scan_deeper(self) -> None:
         """Ask Wikipedia which of the unchecked items are based on a true story."""
@@ -2026,7 +2078,7 @@ class SettingsView(tk.Frame):
             text=f"Checking {len(items)} item(s) on Wikipedia…")
 
         def worker() -> None:
-            flagged: list[int] = []
+            flagged: list[dict] = []
             state = {"done": 0}
 
             def on_result(index: int, match) -> None:
@@ -2034,7 +2086,7 @@ class SettingsView(tk.Frame):
                 self._db.set_true_story(item["id"], match.is_true_story,
                                         match.article)
                 if match.is_true_story:
-                    flagged.append(item["id"])
+                    flagged.append({**item, "true_story_article": match.article})
 
             def progress(done: int, total: int, item: dict) -> None:
                 state["done"] = done
@@ -2078,7 +2130,7 @@ class SettingsView(tk.Frame):
             text=f"Caching the story of {done} of {total} title(s) · {left}")
 
     def _deeper_finished(self, done: int, found: int, total: int,
-                         stopped: bool, flagged: list[int]) -> None:
+                         stopped: bool, flagged: list[dict]) -> None:
         self._deeper_running = False
         self._deeper_scan_btn.configure(state="normal")
         self._deeper_stop_btn.configure(state="disabled")
@@ -2086,12 +2138,21 @@ class SettingsView(tk.Frame):
         self._refresh_deeper_list(force=True)
         if flagged and self._on_changed:
             # the library shows the flag in the details view too
-            self._on_changed(flagged)
+            self._on_changed([int(item["id"]) for item in flagged])
         if stopped:
             text = (f"Stopped after {done}/{total} item(s) — {found} based on a "
                     f"true story. The rest is checked by the next scan.")
         else:
             text = f"Checked {done} item(s) — {found} based on a true story."
+        if flagged:
+            results = []
+            for item in flagged:
+                label = _media_result_label(item)
+                article = str(item.get("true_story_article") or "").strip()
+                results.append(f"{label} — {article}" if article else label)
+            text += "\nFound: " + _result_summary(results)
+        elif not stopped:
+            text += "\nNo titles matched."
         self._deeper_status.configure(text=text)
 
     def _cancel_deeper(self) -> None:
@@ -2125,26 +2186,29 @@ class SettingsView(tk.Frame):
         header = tk.Frame(inner, bg=PANEL_BG)
         header.pack(fill="x", pady=(0, 12))
         self._quote_status = tk.Label(header, text="", bg=PANEL_BG, fg=MUTED,
-                                      font=("Segoe UI", 9), anchor="w", justify="left")
-        self._quote_status.pack(side="left", padx=(10, 0))
+                                      font=("Segoe UI", 9), anchor="w", justify="left",
+                                      wraplength=640)
+        self._quote_status.pack(fill="x", padx=(10, 0), pady=(0, 6))
+        controls = tk.Frame(header, bg=PANEL_BG)
+        controls.pack(fill="x")
         btn_style = dict(
             bg=BTN_BG, fg=TEXT, activebackground=BTN_ACTIVE, activeforeground=TEXT,
             disabledforeground="#5a6472", bd=0, padx=12, pady=5,
             font=("Segoe UI", 9), cursor="hand2",
         )
-        tk.Button(header, text="Random quote", command=self._random_quote,
+        tk.Button(controls, text="Random quote", command=self._random_quote,
                   **btn_style).pack(side="right", padx=(8, 0))
-        tk.Button(header, text="Forget quotes", command=self._reset_quotes,
+        tk.Button(controls, text="Forget quotes", command=self._reset_quotes,
                   **btn_style).pack(side="right", padx=(8, 0))
         self._quote_stop_btn = tk.Button(
-            header, text="Stop", command=self._cancel_quotes, state="disabled",
+            controls, text="Stop", command=self._cancel_quotes, state="disabled",
             **btn_style)
         self._quote_stop_btn.pack(side="right", padx=(8, 0))
         self._quote_scan_btn = tk.Button(
-            header, text="Fetch quotes", command=self._scan_quotes, **btn_style)
+            controls, text="Fetch quotes", command=self._scan_quotes, **btn_style)
         self._quote_scan_btn.pack(side="right", padx=(8, 0))
         self._quote_progress = ttk.Progressbar(
-            header, mode="determinate", length=160,
+            controls, mode="determinate", length=160,
             style="Dark.Horizontal.TProgressbar")
 
         body = tk.Frame(inner, bg=PANEL_BG)
@@ -2174,6 +2238,7 @@ class SettingsView(tk.Frame):
         self._quote_tree.configure(yscrollcommand=vsb.set)
         self._quote_tree.pack(side="left", fill="both", expand=True)
         self._quote_tree.bind("<<TreeviewSelect>>", self._on_quote_select)
+        self._quote_tree.bind("<Button-3>", self._quote_menu)
 
         read = tk.Frame(body, bg=PANEL_BG, highlightthickness=1,
                         highlightbackground=BORDER)
@@ -2211,6 +2276,27 @@ class SettingsView(tk.Frame):
         self._quote_status.configure(
             text=f"{len(items)} film(s) with quotes · {total} quotes")
         return len(items)
+
+    def _quote_menu(self, event) -> None:
+        """Right-click on a film to forget its quotes."""
+        iid = self._quote_tree.identify_row(event.y)
+        if not iid:
+            return
+        self._quote_tree.selection_set(iid)
+        item = self._quote_items.get(int(iid))
+        if item is None:
+            return
+        PopupMenu(self, event.x_root, event.y_root, [
+            ("Forget quotes", lambda: self._forget_quotes(item["id"])),
+        ])
+
+    def _forget_quotes(self, media_id: int) -> None:
+        item = self._quote_items.get(media_id, {})
+        self._db.forget_quotes(media_id)
+        self._refresh_quote_list()
+        title = str(item.get("title") or "This title")
+        self._quote_status.configure(
+            text=f"Forgot quotes for {title} - it will be looked up again.")
 
     def _set_quote_text(self, *blocks: tuple[str, str]) -> None:
         self._quote_text.configure(state="normal")
@@ -2278,7 +2364,7 @@ class SettingsView(tk.Frame):
 
         def worker() -> None:
             done = 0
-            found = 0
+            found: list[tuple[dict, str]] = []
             for start in range(0, len(items), 6):
                 if self._quote_cancel.is_set():
                     break
@@ -2287,14 +2373,16 @@ class SettingsView(tk.Frame):
                 if quotes is None:
                     break
                 for item in chunk:
+                    item_quotes = quotes.get(item["id"], [])
                     self._db.set_quotes(
                         item["id"],
                         [{"text": t, "speaker": s}
-                         for t, s in quotes.get(item["id"], [])])
+                         for t, s in item_quotes])
+                    if item_quotes:
+                        found.append((item, item_quotes[0][0]))
                 done += len(chunk)
-                found += sum(1 for v in quotes.values() if v)
                 self._post(lambda d=done: self._quote_progress.configure(value=d))
-            self._post(lambda: self._quotes_finished(done, found, len(items)))
+            self._post(lambda: self._quotes_finished(done, len(items), found))
 
         threading.Thread(target=self._db.thread_target(worker), daemon=True).start()
 
@@ -2319,17 +2407,24 @@ class SettingsView(tk.Frame):
                 return None
         return None
 
-    def _quotes_finished(self, done: int, found: int, total: int) -> None:
+    def _quotes_finished(self, done: int, total: int,
+                         found: list[tuple[dict, str]]) -> None:
         self._quote_running = False
         self._quote_scan_btn.configure(state="normal")
         self._quote_stop_btn.configure(state="disabled")
         self._quote_progress.pack_forget()
         self._refresh_quote_list()
         if self._quote_cancel.is_set():
-            text = (f"Stopped after {done}/{total} film(s) — {found} with quotes. "
+            text = (f"Stopped after {done}/{total} film(s) — "
+                    f"{len(found)} with quotes. "
                     "The next run continues.")
         else:
-            text = f"Looked up {done} film(s) — {found} have quotes."
+            text = f"Looked up {done}/{total} film(s) — {len(found)} have quotes."
+        if found:
+            text += "\nFound: " + _result_summary(
+                [_quote_result_label(item, quote) for item, quote in found])
+        elif not self._quote_cancel.is_set():
+            text += "\nNo quotes found."
         self._quote_status.configure(text=text)
 
     def _cancel_quotes(self) -> None:
