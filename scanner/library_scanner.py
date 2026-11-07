@@ -6,9 +6,9 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable
 
-from core.utils import title_parser as tp
-from core.utils.image_utils import find_artwork
-from core.utils.path_utils import canonical_path
+from utils import title_parser as tp
+from utils.image_utils import find_artwork
+from utils.path_utils import canonical_path
 
 log = logging.getLogger(__name__)
 

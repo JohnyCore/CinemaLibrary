@@ -11,7 +11,7 @@ from typing import Callable
 from PIL import Image, ImageTk
 
 from ui.icons import font as icon_font, glyph as icon_glyph
-from core.utils.image_cache import ImageCache, ImageJob
+from utils.image_cache import ImageCache, ImageJob
 
 BG = "#0d0e12"
 CARD_BG = "#161a22"

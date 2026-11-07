@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Callable
 
 import config
-from core.db.db_manager import Database
+from database.db_manager import Database
 from metadata import metadata_service
 from ui.dialogs import ConfirmDialog
 from ui.icons import photo as icon_photo

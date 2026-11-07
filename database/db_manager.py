@@ -16,6 +16,16 @@ from utils.path_utils import canonical_path
 log = logging.getLogger(__name__)
 _T = TypeVar("_T")
 
+
+def _sqlite_path_name(value: object) -> str | None:
+    """Return a file name suitable for comparisons in SQL."""
+    if value is None:
+        return None
+    text = str(value)
+    if not text:
+        return ""
+    return Path(text).name.lower()
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS media (
     id INTEGER PRIMARY KEY,
@@ -267,6 +277,7 @@ class Database:
         if conn is None:
             conn = sqlite3.connect(str(self._path), check_same_thread=False)
             conn.row_factory = sqlite3.Row
+            conn.create_function("path_name", 1, _sqlite_path_name)
             # the timeout comes first: the pragmas below need a lock too
             conn.execute("PRAGMA busy_timeout=5000")
             conn.execute("PRAGMA foreign_keys=ON")
@@ -1359,10 +1370,12 @@ class Database:
                               if canonical_path(i.path) in existing
                               and self._changed(existing[canonical_path(i.path)], i))
 
+                renamed_old_paths = {canonical_path(row["path"]) for row in renamed.values()}
                 stale = [
                     (row["id"],)
                     for row in existing.values()
                     if canonical_path(row["path"]) not in new_paths
+                    and canonical_path(row["path"]) not in renamed_old_paths
                     and not self._protected(row["path"], unreadable)
                     and (
                         canonical_path(row["root"]) in scanned_roots
@@ -1386,13 +1399,22 @@ class Database:
                 # Match renames in SQL: by video file name, then by title
                 conn.execute("""
                     UPDATE media SET
+                        path = COALESCE(
+                            (SELECT n.path FROM sync_new_items n
+                             WHERE n.video_path IS NOT NULL
+                               AND media.root = n.root
+                               AND LOWER(path_name(n.video_path)) = LOWER(path_name(media.video_path))),
+                            (SELECT n.path FROM sync_new_items n
+                             WHERE media.root = n.root
+                               AND LOWER(n.title) = LOWER(media.title)),
+                            media.path),
                         title = CASE
                             WHEN media.from_provider = 1 THEN media.title
                             ELSE COALESCE(
                                 (SELECT n.title FROM sync_new_items n
                                  WHERE n.video_path IS NOT NULL
                                    AND media.root = n.root
-                                   AND LOWER(Path(n.video_path)) = LOWER(Path(media.video_path))),
+                                   AND LOWER(path_name(n.video_path)) = LOWER(path_name(media.video_path))),
                                 (SELECT n.title FROM sync_new_items n
                                  WHERE media.root = n.root
                                    AND LOWER(n.title) = LOWER(media.title)),
@@ -1402,7 +1424,7 @@ class Database:
                             (SELECT n.media_type FROM sync_new_items n
                              WHERE n.video_path IS NOT NULL
                                AND media.root = n.root
-                               AND LOWER(Path(n.video_path)) = LOWER(Path(media.video_path))),
+                               AND LOWER(path_name(n.video_path)) = LOWER(path_name(media.video_path))),
                             (SELECT n.media_type FROM sync_new_items n
                              WHERE media.root = n.root
                                AND LOWER(n.title) = LOWER(media.title)),
@@ -1411,7 +1433,7 @@ class Database:
                             (SELECT n.year FROM sync_new_items n
                              WHERE n.video_path IS NOT NULL
                                AND media.root = n.root
-                               AND LOWER(Path(n.video_path)) = LOWER(Path(media.video_path))),
+                               AND LOWER(path_name(n.video_path)) = LOWER(path_name(media.video_path))),
                             (SELECT n.year FROM sync_new_items n
                              WHERE media.root = n.root
                                AND LOWER(n.title) = LOWER(media.title)),
@@ -1420,7 +1442,7 @@ class Database:
                             (SELECT n.root FROM sync_new_items n
                              WHERE n.video_path IS NOT NULL
                                AND media.root = n.root
-                               AND LOWER(Path(n.video_path)) = LOWER(Path(media.video_path))),
+                               AND LOWER(path_name(n.video_path)) = LOWER(path_name(media.video_path))),
                             (SELECT n.root FROM sync_new_items n
                              WHERE media.root = n.root
                                AND LOWER(n.title) = LOWER(media.title)),
@@ -1429,7 +1451,7 @@ class Database:
                             (SELECT n.video_path FROM sync_new_items n
                              WHERE n.video_path IS NOT NULL
                                AND media.root = n.root
-                               AND LOWER(Path(n.video_path)) = LOWER(Path(media.video_path))),
+                               AND LOWER(path_name(n.video_path)) = LOWER(path_name(media.video_path))),
                             (SELECT n.video_path FROM sync_new_items n
                              WHERE media.root = n.root
                                AND LOWER(n.title) = LOWER(media.title)),
@@ -1438,7 +1460,7 @@ class Database:
                             (SELECT n.poster_path FROM sync_new_items n
                              WHERE n.video_path IS NOT NULL
                                AND media.root = n.root
-                               AND LOWER(Path(n.video_path)) = LOWER(Path(media.video_path))),
+                               AND LOWER(path_name(n.video_path)) = LOWER(path_name(media.video_path))),
                             (SELECT n.poster_path FROM sync_new_items n
                              WHERE media.root = n.root
                                AND LOWER(n.title) = LOWER(media.title)),
@@ -1447,7 +1469,7 @@ class Database:
                             (SELECT n.poster2_path FROM sync_new_items n
                              WHERE n.video_path IS NOT NULL
                                AND media.root = n.root
-                               AND LOWER(Path(n.video_path)) = LOWER(Path(media.video_path))),
+                               AND LOWER(path_name(n.video_path)) = LOWER(path_name(media.video_path))),
                             (SELECT n.poster2_path FROM sync_new_items n
                              WHERE media.root = n.root
                                AND LOWER(n.title) = LOWER(media.title)),
@@ -1456,7 +1478,7 @@ class Database:
                             (SELECT n.mtime FROM sync_new_items n
                              WHERE n.video_path IS NOT NULL
                                AND media.root = n.root
-                               AND LOWER(Path(n.video_path)) = LOWER(Path(media.video_path))),
+                               AND LOWER(path_name(n.video_path)) = LOWER(path_name(media.video_path))),
                             (SELECT n.mtime FROM sync_new_items n
                              WHERE media.root = n.root
                                AND LOWER(n.title) = LOWER(media.title)),
@@ -1466,7 +1488,7 @@ class Database:
                             (SELECT n.mtime FROM sync_new_items n
                              WHERE n.video_path IS NOT NULL
                                AND media.root = n.root
-                               AND LOWER(Path(n.video_path)) = LOWER(Path(media.video_path))),
+                               AND LOWER(path_name(n.video_path)) = LOWER(path_name(media.video_path))),
                             (SELECT n.mtime FROM sync_new_items n
                              WHERE media.root = n.root
                                AND LOWER(n.title) = LOWER(media.title)),
@@ -1475,7 +1497,7 @@ class Database:
                         SELECT 1 FROM sync_new_items n
                         WHERE (n.video_path IS NOT NULL
                                AND media.root = n.root
-                               AND LOWER(Path(n.video_path)) = LOWER(Path(media.video_path)))
+                               AND LOWER(path_name(n.video_path)) = LOWER(path_name(media.video_path)))
                            OR (media.root = n.root
                                AND LOWER(n.title) = LOWER(media.title))
                     )
@@ -1492,7 +1514,7 @@ class Database:
                         SELECT 1 FROM media m
                         WHERE (n.video_path IS NOT NULL
                                AND m.root = n.root
-                               AND LOWER(Path(n.video_path)) = LOWER(Path(m.video_path)))
+                               AND LOWER(path_name(n.video_path)) = LOWER(path_name(m.video_path)))
                            OR (m.root = n.root
                                AND LOWER(n.title) = LOWER(m.title))
                     )

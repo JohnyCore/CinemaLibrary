@@ -366,6 +366,7 @@ def rename_episode_files(entries: list[EpisodeRename]) -> int:
 def save_undo(moves: list[tuple[str, str]]) -> None:
     """Remember the last applied rename so it can be taken back."""
     try:
+        _UNDO_PATH.parent.mkdir(parents=True, exist_ok=True)
         _UNDO_PATH.write_text(json.dumps(
             {"moves": [{"old": old, "new": new} for old, new in moves]}),
             encoding="utf-8")

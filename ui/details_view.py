@@ -12,11 +12,11 @@ from typing import Callable
 
 from PIL import Image, ImageTk
 
-from core.db.db_manager import Database
-from core.metadata import metadata_service
-from core.organizer import media_ops
-from core.utils.image_cache import ImageCache, ImageJob
-from core.utils.image_utils import find_artwork
+from database.db_manager import Database
+from metadata import metadata_service
+from utils import media_ops
+from utils.image_cache import ImageCache, ImageJob
+from utils.image_utils import find_artwork
 from ui.window_utils import ScrollArea, setup_popup
 from ui.icons import font as icon_font, glyph as icon_glyph, photo as icon_photo
 from ui.dialogs import ImdbIdDialog
@@ -647,7 +647,7 @@ class DetailsView(tk.Frame):
             log.exception("could not open browser for %s", imdb_id)
 
     def _dispatch_filter(self, kind: str, value: str) -> None:
-        from core.events import event_bus, FilterRequested
+        from events import event_bus, FilterRequested
         event_bus.emit(FilterRequested(kind=kind, value=value))
     @staticmethod
     def _split_names(value) -> list[str]:
@@ -1057,7 +1057,7 @@ class DetailsView(tk.Frame):
         self._fetch_selected(candidate, media_id, generation, overwrite_artwork)
 
     def _notify_fetched(self, media_id: int) -> None:
-            from core.events import event_bus, ItemFetched
+            from events import event_bus, ItemFetched
             event_bus.emit(ItemFetched(media_id=media_id))
 
     def _refresh_from_db(self, media_id: int) -> None:

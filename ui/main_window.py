@@ -22,12 +22,12 @@ from typing import Callable
 from PIL import Image, UnidentifiedImageError
 
 import config
-from core.db.db_manager import Database
-from core.metadata import metadata_service
-from core.metadata.person_profiles import fetch_person_profile, person_key
-from core.scanner import scan_state
-from core.scanner.library_scanner import scan
-from core.events import event_bus, ItemFetched, ScanFinished, MetadataChanged, ItemWatched, ItemRating
+from database.db_manager import Database
+from metadata import metadata_service
+from metadata.person_profiles import fetch_person_profile, person_key
+from scanner import scan_state
+from scanner.library_scanner import scan
+from events import event_bus, ItemFetched, ScanFinished, MetadataChanged, ItemWatched, ItemRating
 from ui.details_view import DetailsView
 from ui.dialogs import ConfirmDialog, PopupMenu, PromptDialog
 from ui.folder_dialog import FolderDialog
@@ -35,8 +35,8 @@ from ui.icons import photo as icon_photo
 from ui.library_view import LibraryView
 from ui.settings_view import SettingsView
 from ui.watched_elsewhere_view import WatchedElsewhereView
-from core.organizer import media_ops
-from core.utils.image_cache import ImageCache
+from utils import media_ops
+from utils.image_cache import ImageCache
 
 log = logging.getLogger(__name__)
 
@@ -258,7 +258,7 @@ class MainWindow(tk.Frame):
         self._show_library()
 
         self._load_from_db()
-        # Subscribe to core events
+        # Subscribe to application events
         event_bus.subscribe(ItemFetched, lambda e: self._on_item_fetched(e.media_id))
         event_bus.subscribe(ScanFinished, lambda e: self._on_scan_finished(e.counts))
         event_bus.subscribe(MetadataChanged, lambda e: self._on_items_fetched(e.media_ids))

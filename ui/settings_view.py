@@ -15,13 +15,13 @@ from pathlib import Path
 from tkinter import filedialog, ttk
 
 import config
-from core.db.db_manager import Database
-from core.metadata import metadata_service
-from core.metadata import true_story
-from core.metadata.person_profiles import fetch_person_profile, person_key
-from core.organizer import media_ops
-from core.utils.image_cache import BACKDROP_SIZES, ImageCache
-from core.utils.image_utils import find_artwork
+from database.db_manager import Database
+from metadata import metadata_service
+from metadata import true_story
+from metadata.person_profiles import fetch_person_profile, person_key
+from utils import media_ops
+from utils.image_cache import BACKDROP_SIZES, ImageCache
+from utils.image_utils import find_artwork
 from ui.dialogs import (ConfirmDialog, DuplicateResolver, ImdbIdDialog,
                         PlayerDialog, PopupMenu)
 from ui.ep_renamer_view import EpRenamerView
