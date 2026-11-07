@@ -6,12 +6,14 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable
 
-import config
-from utils import title_parser as tp
-from utils.image_utils import find_artwork
-from utils.path_utils import canonical_path
+from core.utils import title_parser as tp
+from core.utils.image_utils import find_artwork
+from core.utils.path_utils import canonical_path
 
 log = logging.getLogger(__name__)
+
+# Video extensions defined here to avoid circular import with config
+VIDEO_EXTS = {".mkv", ".mp4", ".avi", ".mov", ".wmv", ".m4v", ".ts"}
 
 _SKIP_DIRS = {
     "sample", "samples", "extras", "featurettes", "proof", "screens",
@@ -106,7 +108,7 @@ def scan(
 
 
 def _is_video(name: str) -> bool:
-    return Path(name).suffix.lower() in config.VIDEO_EXTS
+    return Path(name).suffix.lower() in VIDEO_EXTS
 
 
 def _wanted(name: str) -> bool:

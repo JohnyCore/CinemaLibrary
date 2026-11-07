@@ -12,14 +12,15 @@ from typing import Callable
 
 from PIL import Image, ImageTk
 
-from database.db_manager import Database
-from metadata import metadata_service
-from utils import media_ops
-from utils.image_cache import ImageCache, ImageJob
-from utils.image_utils import find_artwork
+from core.db.db_manager import Database
+from core.metadata import metadata_service
+from core.organizer import media_ops
+from core.utils.image_cache import ImageCache, ImageJob
+from core.utils.image_utils import find_artwork
 from ui.window_utils import ScrollArea, setup_popup
 from ui.icons import font as icon_font, glyph as icon_glyph, photo as icon_photo
 from ui.dialogs import ImdbIdDialog
+from utils.image_cache import BACKDROP_SIZES, bucket_size
 
 log = logging.getLogger(__name__)
 
@@ -50,7 +51,6 @@ BTN_SMALL = dict(
 
 class DetailsView(tk.Frame):
     def __init__(self, master, images: ImageCache, on_back, db: Database,
-                  on_fetched=None, on_filter=None,
                   post: Callable[[Callable[[], None]], None] | None = None,
                   on_person=None, on_elsewhere_save=None,
                   on_elsewhere_watched=None, on_open_local_match=None) -> None:
@@ -58,8 +58,6 @@ class DetailsView(tk.Frame):
         self._images = images
         self._on_back = on_back
         self._db = db
-        self._on_fetched = on_fetched
-        self._on_filter = on_filter
         self._on_person = on_person
         self._on_elsewhere_save = on_elsewhere_save
         self._on_elsewhere_watched = on_elsewhere_watched
@@ -85,6 +83,8 @@ class DetailsView(tk.Frame):
         self._panel: dict[str, tk.Widget] = {}
         self._panel_item_id: int | None = None
         self._panel_signature: tuple | None = None
+        # Bucket cache for tinted backdrops: bucket_size -> PhotoImage
+        self._backdrop_buckets: dict[tuple[int, int], ImageTk.PhotoImage] = {}
 
         self.canvas = tk.Canvas(self, bg=BG, highlightthickness=0)
         self.canvas.pack(fill="both", expand=True)
@@ -647,12 +647,8 @@ class DetailsView(tk.Frame):
             log.exception("could not open browser for %s", imdb_id)
 
     def _dispatch_filter(self, kind: str, value: str) -> None:
-        if self._on_filter is not None:
-            try:
-                self._on_filter(kind, value)
-            except Exception:
-                log.exception("filter dispatch failed for %s=%s", kind, value)
-
+        from core.events import event_bus, FilterRequested
+        event_bus.emit(FilterRequested(kind=kind, value=value))
     @staticmethod
     def _split_names(value) -> list[str]:
         if value is None:
@@ -1018,11 +1014,7 @@ class DetailsView(tk.Frame):
                 return
             if result is not None:
                 self._refresh_from_db(media_id)
-                if self._on_fetched is not None:
-                    try:
-                        self._on_fetched(media_id)
-                    except Exception:
-                        log.exception("post-fetch refresh failed")
+                event_bus.emit(ItemFetched(media_id=media_id))
                 # the panel was rebuilt above, so set the final state last
                 if self._fetch_btn is not None:
                     self._fetch_btn.configure(state="normal", text="Fetch again")
@@ -1065,11 +1057,8 @@ class DetailsView(tk.Frame):
         self._fetch_selected(candidate, media_id, generation, overwrite_artwork)
 
     def _notify_fetched(self, media_id: int) -> None:
-        if self._on_fetched is not None:
-            try:
-                self._on_fetched(media_id)
-            except Exception:
-                log.exception("post-change refresh failed")
+            from core.events import event_bus, ItemFetched
+            event_bus.emit(ItemFetched(media_id=media_id))
 
     def _refresh_from_db(self, media_id: int) -> None:
         fresh = self._db.get(media_id) or self._item
@@ -1282,63 +1271,90 @@ class DetailsView(tk.Frame):
         pass
 
     def _load_backdrop(self) -> None:
-        """Request a backdrop rendered to the canvas's current dimensions."""
-        width = self.canvas.winfo_width()
-        height = self.canvas.winfo_height()
-        if width < 2 or height < 2:
-            # not laid out yet - try again once the widget has a size
-            if self._bg_attempts < 12:
-                self._bg_attempts += 1
-                self.after(60, self._load_backdrop)
-            return
-        self._bg_attempts = 0
-        if self._bg_job is not None:
-            self._images.cancel(self._bg_job)
-            self._bg_job = None
-        self._last_geo = (width, height)
-        item = self._item or {}
-        source = item.get("poster2_path") or item.get("poster_path")
-        self._bg_job = self._images.get_backdrop(
-            source, (width, height), self._apply_bg, priority=0,
-        )
+            """Request a backdrop at the nearest bucket size, cache tinted versions."""
+            width = self.canvas.winfo_width()
+            height = self.canvas.winfo_height()
+            if width < 2 or height < 2:
+                # not laid out yet - the <Configure> event will call us again
+                return
+            self._bg_attempts = 0
+            if self._bg_job is not None:
+                self._images.cancel(self._bg_job)
+                self._bg_job = None
+            # Use bucket size for the main backdrop
+            bucket_w, bucket_h = bucket_size(width, height)
+            self._last_geo = (width, height)
+            self._last_bucket = (bucket_w, bucket_h)
+            item = self._item or {}
+            source = item.get("poster2_path") or item.get("poster_path")
+            self._bg_job = self._images.get_backdrop(
+                source, (bucket_w, bucket_h), self._apply_bg, priority=0,
+            )
 
     def _apply_bg(self, image) -> None:
-        if not self.winfo_exists() or image is None:
-            return
-        self._bg_job = None
-        # the view keeps the picture: the Tk image must not die with the
-        # cache entry it came from
-        self._bg_image = image
-        if self._bg_id is None:
-            self._bg_id = self.canvas.create_image(0, 0, anchor="nw", image=image)
-        else:
-            self.canvas.itemconfig(self._bg_id, image=image)
-        self.canvas.tag_lower(self._bg_id)
-        if self._resize_job is None:
-            self._refresh_panel_backdrop()
+            if not self.winfo_exists() or image is None:
+                return
+            self._bg_job = None
+            # the view keeps the picture: the Tk image must not die with the
+            # cache entry it came from
+            self._bg_image = image
+            if self._bg_id is None:
+                self._bg_id = self.canvas.create_image(0, 0, anchor="nw", image=image)
+            else:
+                self.canvas.itemconfig(self._bg_id, image=image)
+            self.canvas.tag_lower(self._bg_id)
+            if self._resize_job is None:
+                self._refresh_panel_backdrop()
 
     def _refresh_panel_backdrop(self) -> None:
-        """Draw a tinted crop of the backdrop behind the panel's widgets."""
-        if self._bg_image is None or not self.info.winfo_ismapped():
-            return
-        width, height = self.info.winfo_width(), self.info.winfo_height()
-        canvas_width, canvas_height = self.canvas.winfo_width(), self.canvas.winfo_height()
-        if min(width, height, canvas_width, canvas_height) < 2:
-            return
+            """Draw a tinted crop of the backdrop behind the panel's widgets.
+        
+            Uses bucket cache to avoid re-blending on every resize.
+            """
+            if self._bg_image is None or not self.info.winfo_ismapped():
+                return
+            width, height = self.info.winfo_width(), self.info.winfo_height()
+            canvas_width, canvas_height = self.canvas.winfo_width(), self.canvas.winfo_height()
+            if min(width, height, canvas_width, canvas_height) < 2:
+                return
 
-        source = ImageTk.getimage(self._bg_image).convert("RGB")
-        if source.size != (canvas_width, canvas_height):
-            resampling = getattr(Image, "Resampling", Image).LANCZOS
-            source = source.resize((canvas_width, canvas_height), resampling)
-        x = self.info.winfo_rootx() - self.canvas.winfo_rootx()
-        y = self.info.winfo_rooty() - self.canvas.winfo_rooty()
-        crop = source.crop((x, y, x + width, y + height))
-        tint = Image.new("RGB", crop.size, PANEL_TINT)
-        tinted = Image.blend(crop, tint, PANEL_TINT_STRENGTH)
-        photo = ImageTk.PhotoImage(tinted)
-        self._panel_backdrop.delete("all")
-        self._panel_backdrop.create_image(0, 0, anchor="nw", image=photo)
-        self._panel_backdrop_image = photo
+            bucket_key = getattr(self, "_last_bucket", None)
+            if bucket_key is None:
+                bucket_key = bucket_size(canvas_width, canvas_height)
+                self._last_bucket = bucket_key
+
+            # Check bucket cache for tinted backdrop at panel size
+            cache_key = (bucket_key, width, height)
+            cached = self._backdrop_buckets.get(cache_key)
+            if cached is not None:
+                self._panel_backdrop.delete("all")
+                self._panel_backdrop.create_image(0, 0, anchor="nw", image=cached)
+                self._panel_backdrop_image = cached
+                return
+
+            # Need to create tinted backdrop - use the bucket-sized source
+            source = ImageTk.getimage(self._bg_image).convert("RGB")
+            # Resize source to canvas size if needed
+            if source.size != (canvas_width, canvas_height):
+                resampling = getattr(Image, "Resampling", Image).LANCZOS
+                source = source.resize((canvas_width, canvas_height), resampling)
+            x = self.info.winfo_rootx() - self.canvas.winfo_rootx()
+            y = self.info.winfo_rooty() - self.canvas.winfo_rooty()
+            crop = source.crop((x, y, x + width, y + height))
+            tint = Image.new("RGB", crop.size, PANEL_TINT)
+            tinted = Image.blend(crop, tint, PANEL_TINT_STRENGTH)
+            photo = ImageTk.PhotoImage(tinted)
+            # Cache it
+            self._backdrop_buckets[cache_key] = photo
+            # Limit cache size
+            if len(self._backdrop_buckets) > 12:
+                # Remove oldest (first inserted)
+                oldest = next(iter(self._backdrop_buckets))
+                del self._backdrop_buckets[oldest]
+
+            self._panel_backdrop.delete("all")
+            self._panel_backdrop.create_image(0, 0, anchor="nw", image=photo)
+            self._panel_backdrop_image = photo
 
     def _load_poster(self, poster: tk.Canvas) -> None:
         if self._poster_job is not None:

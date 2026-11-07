@@ -15,13 +15,13 @@ from pathlib import Path
 from tkinter import filedialog, ttk
 
 import config
-from database.db_manager import Database
-from metadata import metadata_service
-from metadata import true_story
-from metadata.person_profiles import fetch_person_profile, person_key
-from utils import media_ops
-from utils.image_cache import BACKDROP_SIZES, ImageCache
-from utils.image_utils import find_artwork
+from core.db.db_manager import Database
+from core.metadata import metadata_service
+from core.metadata import true_story
+from core.metadata.person_profiles import fetch_person_profile, person_key
+from core.organizer import media_ops
+from core.utils.image_cache import BACKDROP_SIZES, ImageCache
+from core.utils.image_utils import find_artwork
 from ui.dialogs import (ConfirmDialog, DuplicateResolver, ImdbIdDialog,
                         PlayerDialog, PopupMenu)
 from ui.ep_renamer_view import EpRenamerView
@@ -68,7 +68,116 @@ def _result_summary(labels: list[str]) -> str:
     return "; ".join(shown)
 
 
-class SettingsView(tk.Frame):
+
+class VirtualizedTreeMixin:
+    """Mixin to add virtualized rendering to ttk.Treeview.
+    
+    Only renders visible items + buffer. Data stays in memory.
+    """
+    _virt_items: list = []          # All data items
+    _virt_visible_range: tuple = (0, 0)  # (first_idx, last_idx) currently rendered
+    _virt_buffer: int = 10          # Extra items to render above/below viewport
+    _virt_row_height: int = 26      # Approximate row height
+    _virt_last_update: float = 0    # Throttle updates
+    
+    def _virt_init(self, tree: ttk.Treeview, buffer: int = 10, row_height: int = 26):
+        """Initialize virtualization for a treeview."""
+        self._virt_tree = tree
+        self._virt_buffer = buffer
+        self._virt_row_height = row_height
+        self._virt_items = []
+        self._virt_visible_range = (0, 0)
+        
+        # Bind scroll events
+        tree.configure(yscrollcommand=self._virt_on_scroll)
+        tree.bind("<<TreeviewSelect>>", self._virt_on_select, add="+")
+        tree.bind("<Configure>", self._virt_on_configure, add="+")
+        
+    def _virt_set_items(self, items: list):
+        """Set the full item list and refresh visible range."""
+        self._virt_items = items
+        self._virt_refresh_visible()
+        
+    def _virt_on_scroll(self, *args):
+        """Handle scrollbar movement - throttle and refresh."""
+        self._virt_tree.yview(*args)
+        import time
+        now = time.time()
+        if now - self._virt_last_update > 0.05:  # 20fps max
+            self._virt_last_update = now
+            self._virt_refresh_visible()
+            
+    def _virt_on_configure(self, event):
+        """Handle tree resize."""
+        self._virt_refresh_visible()
+        
+    def _virt_on_select(self, event):
+        """Handle selection - ensure selected item is rendered."""
+        # Could expand to render selection if needed
+        pass
+        
+    def _virt_refresh_visible(self):
+        """Calculate and render only visible items."""
+        tree = self._virt_tree
+        if not tree.winfo_exists():
+            return
+            
+        # Get visible range from scrollbar
+        try:
+            yview = tree.yview()
+            if not yview or len(yview) != 2:
+                return
+            first_frac, last_frac = yview
+        except Exception:
+            return
+            
+        # Calculate visible item indices
+        total = len(self._virt_items)
+        if total == 0:
+            return
+            
+        # Estimate visible range
+        first_idx = int(first_frac * total)
+        last_idx = int(last_frac * total)
+        
+        # Add buffer
+        first_idx = max(0, first_idx - self._virt_buffer)
+        last_idx = min(total - 1, last_idx + self._virt_buffer)
+        
+        # Check if range changed significantly
+        old_first, old_last = self._virt_visible_range
+        if (abs(first_idx - old_first) < self._virt_buffer and 
+            abs(last_idx - old_last) < self._virt_buffer):
+            return
+            
+        self._virt_visible_range = (first_idx, last_idx)
+        
+        # Delete non-visible items, insert new visible ones
+        existing = set(tree.get_children())
+        needed = set(str(i) for i in range(first_idx, last_idx + 1))
+        
+        # Remove items no longer needed
+        for iid in existing - needed:
+            try:
+                tree.delete(iid)
+            except Exception:
+                pass
+                
+        # Insert missing items
+        for idx in range(first_idx, last_idx + 1):
+            iid = str(idx)
+            if iid not in existing:
+                self._virt_insert_item(idx)
+                
+    def _virt_insert_item(self, idx: int):
+        """Insert a single item at index - override in subclass."""
+        raise NotImplementedError
+        
+    def _virt_get_item_data(self, idx: int):
+        """Get item data for index - override in subclass."""
+        return self._virt_items[idx] if 0 <= idx < len(self._virt_items) else None
+
+class SettingsView(VirtualizedTreeMixin, tk.Frame):
     """Full-page settings, shown inside the main content area."""
 
     def __init__(self, master, on_saved, db: Database, images: ImageCache,
@@ -98,6 +207,7 @@ class SettingsView(tk.Frame):
         self._people_running = False
         self._people_cancel = threading.Event()
         self._drag_select_anchor: str | None = None
+        self._bulk_pool = ThreadPoolExecutor(max_workers=FETCH_WORKERS)
 
         header = tk.Frame(self, bg=BG)
         header.pack(fill="x")
@@ -1085,36 +1195,45 @@ class SettingsView(tk.Frame):
             state="disabled" if self._people_running else "normal")
 
     def _refresh_bulk_list(self) -> None:
-        """Reload the list of unfetched items from DB."""
-        if self._people_running:
-            self._bulk_status.configure(text="Wait for the people profile fetch to finish.")
+            """Reload the list of unfetched items from DB."""
+            if self._people_running:
+                self._bulk_status.configure(text="Wait for the people profile fetch to finish.")
+                return
+            self._bulk_items = self._db.get_unfetched()
+            self._bulk_done = set()
+            self._bulk_row_status.clear()
+
+            for iid in self._bulk_tree.get_children():
+                self._bulk_tree.delete(iid)
+
+            if not self._bulk_items:
+                self._bulk_status.configure(text="All items have metadata.")
+                self._fetch_all_btn.configure(state="disabled")
+                self._progress.configure(maximum=1, value=0)
+                return
+
+            self._fetch_all_btn.configure(state="normal")
+            self._bulk_status.configure(text=f"Found {len(self._bulk_items)} items without metadata.")
+
+            # Initialize virtualization
+            self._virt_init(self._bulk_tree, buffer=15, row_height=26)
+            self._virt_set_items(self._bulk_items)
+
+
+    def _virt_insert_item(self, idx: int):
+        """Insert a single bulk item at index."""
+        if idx >= len(self._bulk_items):
             return
-        self._bulk_items = self._db.get_unfetched()
-        self._bulk_done = set()
-        self._bulk_row_status.clear()
-
-        for iid in self._bulk_tree.get_children():
-            self._bulk_tree.delete(iid)
-
-        if not self._bulk_items:
-            self._bulk_status.configure(text="All items have metadata.")
-            self._fetch_all_btn.configure(state="disabled")
-            self._progress.configure(maximum=1, value=0)
-            return
-
-        self._fetch_all_btn.configure(state="normal")
-        self._bulk_status.configure(text=f"Found {len(self._bulk_items)} items without metadata.")
-
-        for idx, item in enumerate(self._bulk_items):
-            media_id = item["id"]
-            title = item.get("title") or "Unknown"
-            year = f" ({item['year']})" if item.get("year") else ""
-            mtype = "Series" if item.get("media_type") == "series" else "Movie"
-            missing = self._missing_fields(item)
-            missing_text = "Missing: " + ", ".join(missing) if missing else ""
-            self._bulk_tree.insert("", "end", iid=str(media_id),
-                                   values=(f"{title}{year}", mtype, missing_text, ""),
-                                   tags=("odd",) if idx % 2 else ())
+        item = self._bulk_items[idx]
+        media_id = item["id"]
+        title = item.get("title") or "Unknown"
+        year = f" ({item['year']})" if item.get("year") else ""
+        mtype = "Series" if item.get("media_type") == "series" else "Movie"
+        missing = self._missing_fields(item)
+        missing_text = "Missing: " + ", ".join(missing) if missing else ""
+        self._bulk_tree.insert("", "end", iid=str(media_id),
+                           values=(f"{title}{year}", mtype, missing_text, ""),
+                           tags=("odd",) if idx % 2 else ())
 
     def _on_bulk_double_click(self, event) -> None:
         """Handle double-click: fetch the item, or offer an IMDb ID on errors."""
@@ -1275,8 +1394,8 @@ class SettingsView(tk.Frame):
             done = 0
             failed = 0
             # The pool is fed by hand: `map` would queue every item up
-            # front, and "Stop" would only end the reporting.
-            pool = ThreadPoolExecutor(max_workers=FETCH_WORKERS)
+                    # front, and "Stop" would only end the reporting.
+            pool = self._bulk_pool
             try:
                 pending: set = set()
                 source = iter(items)

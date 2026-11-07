@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -39,6 +40,7 @@ _BACKOFF = (10.0, 20.0, 40.0)
 
 _last_request = [0.0]
 _last_quote = [0.0]
+_request_lock = threading.Lock()
 
 # the sections of a page that list things instead of quoting them
 _LIST_SECTION = re.compile(
@@ -93,10 +95,11 @@ def _get(url: str, data: bytes | None = None, tries: int = 4,
     clock = tracker if tracker is not None else _last_request
     for attempt in range(tries):
         if gap:
-            wait = time.time() - clock[0]
-            if wait < gap:
-                time.sleep(gap - wait)
-            clock[0] = time.time()
+            with _request_lock:
+                wait = time.time() - clock[0]
+                if wait < gap:
+                    time.sleep(gap - wait)
+                clock[0] = time.time()
         try:
             request = urllib.request.Request(
                 url, data=data,

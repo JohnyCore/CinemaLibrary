@@ -22,11 +22,12 @@ from typing import Callable
 from PIL import Image, UnidentifiedImageError
 
 import config
-from database.db_manager import Database
-from metadata import metadata_service
-from metadata.person_profiles import fetch_person_profile, person_key
-from scanner import scan_state
-from scanner.library_scanner import scan
+from core.db.db_manager import Database
+from core.metadata import metadata_service
+from core.metadata.person_profiles import fetch_person_profile, person_key
+from core.scanner import scan_state
+from core.scanner.library_scanner import scan
+from core.events import event_bus, ItemFetched, ScanFinished, MetadataChanged, ItemWatched, ItemRating
 from ui.details_view import DetailsView
 from ui.dialogs import ConfirmDialog, PopupMenu, PromptDialog
 from ui.folder_dialog import FolderDialog
@@ -34,8 +35,8 @@ from ui.icons import photo as icon_photo
 from ui.library_view import LibraryView
 from ui.settings_view import SettingsView
 from ui.watched_elsewhere_view import WatchedElsewhereView
-from utils import media_ops
-from utils.image_cache import ImageCache
+from core.organizer import media_ops
+from core.utils.image_cache import ImageCache
 
 log = logging.getLogger(__name__)
 
@@ -257,6 +258,13 @@ class MainWindow(tk.Frame):
         self._show_library()
 
         self._load_from_db()
+        # Subscribe to core events
+        event_bus.subscribe(ItemFetched, lambda e: self._on_item_fetched(e.media_id))
+        event_bus.subscribe(ScanFinished, lambda e: self._on_scan_finished(e.counts))
+        event_bus.subscribe(MetadataChanged, lambda e: self._on_items_fetched(e.media_ids))
+        event_bus.subscribe(ItemWatched, lambda e: self._on_item_watched(e.media_id, e.watched))
+        event_bus.subscribe(ItemRating, lambda e: self._on_item_rating(e.media_id, e.rating))
+
         # a posted callback wakes the main thread at once; the slow poll is
         # only there in case a wake-up event was lost
         root.bind("<<Posted>>", lambda _event=None: self._drain())
@@ -419,25 +427,24 @@ class MainWindow(tk.Frame):
         self._body = body
 
         self._details = DetailsView(
-            body, self._images, self._back_from_details, self._db,
-            self._on_item_fetched, self._on_filter_from_details,
-            post=self._post, on_person=self._show_person_profile,
-            on_elsewhere_save=self._save_elsewhere_item,
-            on_elsewhere_watched=self._refresh_elsewhere,
-            on_open_local_match=self._open_elsewhere_local_match,
+                    body, self._images, self._back_from_details, self._db,
+                    post=self._post, on_person=self._show_person_profile,
+                    on_elsewhere_save=self._save_elsewhere_item,
+                    on_elsewhere_watched=self._refresh_elsewhere,
+                    on_open_local_match=self._open_elsewhere_local_match,
         )
         self._library = LibraryView(body, self._images, self._open_item,
-                                    self._show_context_menu,
-                                    on_profile_close=self._clear_chip)
+                                            self._show_context_menu,
+                                            on_profile_close=self._clear_chip)
         self._elsewhere = WatchedElsewhereView(
-            body, self._db, self._open_elsewhere_candidate,
-            self._open_elsewhere_saved, self._post,
+                    body, self._db, self._open_elsewhere_candidate,
+                    self._open_elsewhere_saved, self._post,
         )
         self._insights = tk.Frame(body, bg=BG)
         self._settings = SettingsView(body, self._on_settings_saved, self._db, self._images,
-                                  on_changed=self._on_items_fetched, post=self._post,
-                                  on_rescan=self._rescan_clicked,
-                                  on_open_item=self._open_item)
+                                          post=self._post,
+                                          on_rescan=self._rescan_clicked,
+                                          on_open_item=self._open_item)
         self._render_insights()
 
         status = tk.Frame(column, bg=TOPBAR_BG, height=30)
@@ -523,17 +530,17 @@ class MainWindow(tk.Frame):
                 self._details.show(refreshed)
 
     def _search_blob(self, item: dict) -> str:
-        parts = [
-            str(item.get("title") or ""),
-            " ".join(DetailsView._as_list(item.get("cast_list"))),
-            str(item.get("director") or ""),
-            str(item.get("writer") or ""),
-            " ".join(DetailsView._as_list(item.get("genres"))),
-            str(item.get("country") or ""),
-            str(item.get("year") or ""),
-            str(item.get("imdb_id") or ""),
-        ]
-        return " ".join(p for p in parts if p).lower()
+            parts = [
+                str(item.get("title") or ""),
+                " ".join(set(DetailsView._as_list(item.get("cast_list")))),
+                str(item.get("director") or ""),
+                str(item.get("writer") or ""),
+                " ".join(set(DetailsView._as_list(item.get("genres")))),
+                str(item.get("country") or ""),
+                str(item.get("year") or ""),
+                str(item.get("imdb_id") or ""),
+            ]
+            return " ".join(p for p in parts if p).lower()
 
     # --- filtering ----------------------------------------------------
 
@@ -1131,26 +1138,26 @@ class MainWindow(tk.Frame):
         self._load_from_db()
 
     def _set_watched(self, items: list[dict], watched: bool) -> None:
-        """Mark items as watched (or as unwatched)."""
-        for item in items:
-            self._db.set_media_watched(item["id"], watched)
-        self._on_items_fetched([i["id"] for i in items])
+            """Mark items as watched (or as unwatched)."""
+            for item in items:
+                self._db.set_media_watched(item["id"], watched)
+            event_bus.emit(MetadataChanged(media_ids=[i["id"] for i in items]))
 
     def _mark_series_watched(self, items: list[dict]) -> None:
-        """Mark every episode of the series as watched."""
-        ids = []
-        for item in items:
-            paths = [e["path"] for e in self._db.episodes(item["id"])]
-            self._db.set_episodes_watched(paths, True)
-            ids.append(item["id"])
-        self._on_items_fetched(ids)
+            """Mark every episode of the series as watched."""
+            ids = []
+            for item in items:
+                paths = [e["path"] for e in self._db.episodes(item["id"])]
+                self._db.set_episodes_watched(paths, True)
+                ids.append(item["id"])
+            event_bus.emit(MetadataChanged(media_ids=ids))
 
     def _remove_metadata(self, items: list[dict]) -> None:
-        """Throw the fetched metadata of the items away."""
-        for item in items:
-            self._db.clear_metadata(item["id"])
-            media_ops.remove_about(item)
-        self._on_items_fetched([i["id"] for i in items])
+            """Throw the fetched metadata of the items away."""
+            for item in items:
+                self._db.clear_metadata(item["id"])
+                media_ops.remove_about(item)
+            event_bus.emit(MetadataChanged(media_ids=[i["id"] for i in items]))
 
     def _on_item_fetched(self, media_id: int) -> None:
         self._on_items_fetched([media_id])
@@ -1178,10 +1185,6 @@ class MainWindow(tk.Frame):
             if self._details._item.get("id") in media_ids:
                 self._details._refresh_from_db(self._details._item["id"])
 
-    def _on_filter_from_details(self, kind: str, value: str) -> None:
-        self._show_library()
-        self._set_section("all")
-        self._set_chip(kind, value)
 
     def _render_insights(self) -> None:
         """Render an interactive, scrollable overview of the local library."""

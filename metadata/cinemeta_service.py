@@ -29,6 +29,26 @@ _YEAR_RE = re.compile(r"(19|20)\d{2}")
 # and a fresh TLS handshake for every one of them dominates the run time
 _local = threading.local()
 
+# Register cleanup for thread-local connections
+import atexit
+import weakref
+
+_connection_registry = weakref.WeakSet()
+
+def _register_connection(conn):
+    """Register a connection for cleanup."""
+    _connection_registry.add(conn)
+
+def _cleanup_connections():
+    """Close all registered connections."""
+    for conn in list(_connection_registry):
+        try:
+            conn.close()
+        except OSError:
+            pass
+
+atexit.register(_cleanup_connections)
+
 
 def _connection(host: str) -> http.client.HTTPSConnection:
     conns = getattr(_local, "conns", None)
@@ -39,6 +59,7 @@ def _connection(host: str) -> http.client.HTTPSConnection:
     if conn is None:
         conn = http.client.HTTPSConnection(host, timeout=_TIMEOUT)
         conns[host] = conn
+        _register_connection(conn)
     return conn
 
 
@@ -148,6 +169,11 @@ def _score(query: str, name: str, year: int | None, want_year: int | None) -> in
         score += hits
     elif not tokens and q not in n:
         return 0
+    # Fuzzy matching for typo tolerance
+    from difflib import SequenceMatcher
+    ratio = SequenceMatcher(None, q, n).ratio()
+    if ratio > 0.8:
+        score += int(ratio * 5)
     if want_year and year:
         if abs(year - want_year) <= 1:
             score += 2

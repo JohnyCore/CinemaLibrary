@@ -11,6 +11,8 @@ LANCZOS = getattr(Image, "Resampling", Image).LANCZOS
 _BACKDROP_STEMS = ("poster2", "fanart", "backdrop")
 _ART_SUBDIRS = {"artwork", "extrafanart", "images", "posters", "fanart", "art"}
 _LETTERBOX_BG = (16, 19, 25)
+# Cache for letterbox background images to avoid GC pressure during scroll
+_LETTERBOX_CACHE: dict[tuple[int, int], Image.Image] = {}
 
 
 def _dir_map(folder: Path, cache: dict | None = None) -> dict[str, os.DirEntry]:
@@ -98,6 +100,11 @@ def open_rgb(path: str, draft_size: tuple[int, int] | None = None) -> Image.Imag
         return None
 
 
+_LETTERBOX_BG = (16, 19, 25)
+# Cache for letterbox background images to avoid GC pressure during scroll
+_LETTERBOX_CACHE: dict[tuple[int, int], Image.Image] = {}
+
+
 def cover_fit(
     img: Image.Image, width: int, height: int, background: tuple = _LETTERBOX_BG,
     contain: bool = False,
@@ -116,7 +123,15 @@ def cover_fit(
         nw = max(1, int(sw * scale + 0.5))
         nh = max(1, int(sh * scale + 0.5))
         smaller = img.resize((nw, nh), LANCZOS)
-        out = Image.new("RGB", (width, height), background)
+        # Reuse cached letterbox background
+        bg_key = (width, height)
+        out = _LETTERBOX_CACHE.get(bg_key)
+        if out is None:
+            out = Image.new("RGB", (width, height), background)
+            _LETTERBOX_CACHE[bg_key] = out
+        else:
+            # Create a copy since we'll paste onto it
+            out = out.copy()
         out.paste(smaller, ((width - nw) // 2, (height - nh) // 2))
         return out
     scale = max(width / sw, height / sh)
@@ -130,7 +145,14 @@ def cover_fit(
     nw = max(1, int(sw * scale + 0.5))
     nh = max(1, int(sh * scale + 0.5))
     smaller = img.resize((nw, nh), LANCZOS)
-    out = Image.new("RGB", (width, height), background)
+    # Reuse cached letterbox background
+    bg_key = (width, height)
+    out = _LETTERBOX_CACHE.get(bg_key)
+    if out is None:
+        out = Image.new("RGB", (width, height), background)
+        _LETTERBOX_CACHE[bg_key] = out
+    else:
+        out = out.copy()
     out.paste(smaller, ((width - nw) // 2, (height - nh) // 2))
     return out
 
@@ -148,5 +170,7 @@ def prepare_art(
     if is_cancelled is not None and is_cancelled():
         return None
     if mode == "backdrop":
+        if is_cancelled is not None and is_cancelled():
+            return None
         img = Image.blend(img, Image.new("RGB", img.size, (10, 12, 16)), 0.55)
     return img

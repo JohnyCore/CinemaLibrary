@@ -11,7 +11,7 @@ from typing import Callable
 from PIL import Image, ImageTk
 
 from ui.icons import font as icon_font, glyph as icon_glyph
-from utils.image_cache import ImageCache, ImageJob
+from core.utils.image_cache import ImageCache, ImageJob
 
 BG = "#0d0e12"
 CARD_BG = "#161a22"
@@ -670,33 +670,48 @@ class LibraryView(tk.Frame):
     # --- drawing ------------------------------------------------------
 
     def _fit_title(self, title: str) -> str:
-        """Shorten a title to two lines, with as few font measurements as possible.
+            """Shorten a title to two lines, with as few font measurements as possible.
 
-        Measuring the string once per removed character is a Tk round trip
-        per character, and every scroll redraw pays it again - a binary
-        search needs about six. The result is kept: the same title comes
-        back on every redraw.
-        """
-        cached = self._fit_cache.get(title)
-        if cached is not None:
-            return cached
-        limit = 2 * self._text_width
-        if self._title_font.measure(title) <= limit:
-            self._remember_fit(title, title)
-            return title
-        low, high = 0, len(title)
-        while low < high:
-            mid = (low + high + 1) // 2
-            if self._title_font.measure(title[:mid] + "…") <= limit:
-                low = mid
-            else:
-                high = mid - 1
-        cut = title[:low].rstrip()
-        if " " in cut:
-            cut = cut.rsplit(" ", 1)[0]
-        result = (cut or title[:low]) + "…"
-        self._remember_fit(title, result)
-        return result
+            Measuring the string once per removed character is a Tk round trip
+            per character, and every scroll redraw pays it again - a binary
+            search needs about six. The result is kept: the same title comes
+            back on every redraw.
+            """
+            cached = self._fit_cache.get(title)
+            if cached is not None:
+                return cached
+            limit = 2 * self._text_width
+            full_width = self._title_font.measure(title)
+            if full_width <= limit:
+                self._remember_fit(title, title)
+                return title
+            # Estimate average character width from the full measurement
+            avg_char_width = full_width / len(title) if title else 10
+            # Calculate approximate max characters that fit (with ellipsis)
+            max_chars = max(1, int((limit - self._title_font.measure("…")) / avg_char_width))
+            # Clamp to valid range
+            max_chars = min(max_chars, len(title) - 1)
+            # Try the estimated cut point
+            cut = title[:max_chars].rstrip()
+            if " " in cut:
+                cut = cut.rsplit(" ", 1)[0]
+            result = (cut or title[:max_chars]) + "…"
+            # Verify with one measurement, adjust if needed
+            if self._title_font.measure(result) > limit:
+                # Fall back to binary search for edge cases
+                low, high = 0, len(title)
+                while low < high:
+                    mid = (low + high + 1) // 2
+                    if self._title_font.measure(title[:mid] + "…") <= limit:
+                        low = mid
+                    else:
+                        high = mid - 1
+                cut = title[:low].rstrip()
+                if " " in cut:
+                    cut = cut.rsplit(" ", 1)[0]
+                result = (cut or title[:low]) + "…"
+            self._remember_fit(title, result)
+            return result
 
     def _remember_fit(self, title: str, result: str) -> None:
         if len(self._fit_cache) > 2000:
@@ -722,36 +737,51 @@ class LibraryView(tk.Frame):
             self._delete_cell(pos)
 
     def _sync_cells(self) -> None:
-        if not self._items:
-            # the old cards have to go: an empty folder must not show the
-            # items of the folder before it
-            self._delete_all_cells()
-            return
-        width = self.canvas.winfo_width()
-        if width < 50:
-            return
-        viewport = self.canvas.winfo_height() or 600
-        top = self.canvas.canvasy(0)
-        row_first = int(top // self._row_h)
-        row_last = int((top + viewport) // self._row_h)
-        lo = max(0, row_first - 1)
-        hi = min(self._rows, row_last + 2)
-        keep: set[tuple[int, int]] = set()
-        for r in range(lo, hi):
-            for c in range(self._cols):
-                idx = r * self._cols + c
-                if idx >= len(self._items):
-                    break
-                pos = (r, c)
-                keep.add(pos)
-                item = self._items[idx]
-                if pos in self._rendered and self._rendered_items.get(pos) is item:
-                    continue
+            if not self._items:
+                # the old cards have to go: an empty folder must not show the
+                # items of the folder before it
+                self._delete_all_cells()
+                return
+            width = self.canvas.winfo_width()
+            if width < 50:
+                return
+            viewport = self.canvas.winfo_height() or 600
+            top = self.canvas.canvasy(0)
+            row_first = int(top // self._row_h)
+            row_last = int((top + viewport) // self._row_h)
+            lo = max(0, row_first - 1)
+            hi = min(self._rows, row_last + 2)
+            keep: set[tuple[int, int]] = set()
+            for r in range(lo, hi):
+                for c in range(self._cols):
+                    idx = r * self._cols + c
+                    if idx >= len(self._items):
+                        break
+                    pos = (r, c)
+                    keep.add(pos)
+                    item = self._items[idx]
+                    if pos in self._rendered and self._rendered_items.get(pos, {}).get("id") == item.get("id"):
+                        continue
+                    self._delete_cell(pos)
+                    priority = 0 if row_first <= r <= row_last else 1
+                    self._draw(pos, item, priority)
+            # Prefetch next row (row_last + 1) thumbnails so they're ready when scrolling
+            prefetch_row = row_last + 1
+            if prefetch_row < self._rows:
+                for c in range(self._cols):
+                    idx = prefetch_row * self._cols + c
+                    if idx >= len(self._items):
+                        break
+                    item = self._items[idx]
+                    src = item.get("poster_path")
+                    if src:
+                        # Fire-and-forget low-priority request
+                        self._images.get_thumbnail(
+                            src, (self._poster_w, self._poster_h),
+                            lambda img: None, priority=10, contain=True
+                        )
+            for pos in [p for p in self._rendered if p not in keep]:
                 self._delete_cell(pos)
-                priority = 0 if row_first <= r <= row_last else 1
-                self._draw(pos, item, priority)
-        for pos in [p for p in self._rendered if p not in keep]:
-            self._delete_cell(pos)
 
     def _draw(self, pos: tuple[int, int], item: dict, priority: int) -> None:
         r, c = pos
@@ -825,8 +855,7 @@ class LibraryView(tk.Frame):
         self._rendered_items[pos] = item
         self._request_image(pos, item, token, priority)
 
-    def _request_image(self, pos: tuple[int, int], item: dict,
-                       token: int, priority: int) -> None:
+    def _request_image(self, pos: tuple[int, int], item: dict, token: int, priority: int) -> None:
         src = item.get("poster_path")
 
         def deliver(image, pos=pos, token=token) -> None:
@@ -837,6 +866,7 @@ class LibraryView(tk.Frame):
         self._jobs[pos] = self._images.get_thumbnail(
             src, (self._poster_w, self._poster_h), deliver, priority=priority
         )
+
 
     def _apply_image(self, pos: tuple[int, int], token: int, image) -> None:
         if image is None or token != self._tokens.get(pos):

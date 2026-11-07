@@ -170,7 +170,8 @@ def move_entry(entry: PlanEntry, root: Path) -> str:
         log.warning("could not move %s: %s", entry.source, exc)
         entry.result = f"failed: {exc}"
         # an empty folder that the failed move left behind is cleaned up
-        drop_empty(target.parent, root)
+        if target.parent.exists():
+            drop_empty(target.parent, root)
     return entry.result
 
 

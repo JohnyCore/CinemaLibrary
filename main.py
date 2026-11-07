@@ -6,11 +6,11 @@ import time
 import tkinter as tk
 
 import config
-from database.db_manager import Database
-from metadata import metadata_service
+from core.db.db_manager import Database
+from core.metadata import metadata_service
 from ui.main_window import MainWindow
 from ui.window_utils import set_dark_title_bar
-from utils import image_utils
+from core.utils import image_utils
 
 
 def main() -> None:
@@ -38,7 +38,7 @@ def main() -> None:
 
     db = Database(config.DB_PATH)
     try:
-        from metadata.cinemeta_service import CinemetaService
+        from core.metadata.cinemeta_service import CinemetaService
         metadata_service.set_service(CinemetaService())
     except Exception:
         logging.getLogger("cinema").exception("metadata service unavailable")
