@@ -32,6 +32,10 @@ ROW_H = CARD_H + GAP_Y
 COL_STEP = CARD_W + GAP_X
 TEXT_WIDTH = CARD_W - 12
 
+# the item fields a card draws - a change in any of them must redraw it
+_CARD_FIELDS = ("title", "year", "media_type", "poster_path",
+                "seen", "watched", "my_rating")
+
 log = logging.getLogger(__name__)
 
 
@@ -760,8 +764,15 @@ class LibraryView(tk.Frame):
                     pos = (r, c)
                     keep.add(pos)
                     item = self._items[idx]
-                    if pos in self._rendered and self._rendered_items.get(pos, {}).get("id") == item.get("id"):
-                        continue
+                    if pos in self._rendered:
+                        # the id matching is not enough: a watched flag or a
+                        # rating gained through the details view has to
+                        # redraw the card's badges
+                        previous = self._rendered_items.get(pos) or {}
+                        if previous.get("id") == item.get("id") and all(
+                                previous.get(field) == item.get(field)
+                                for field in _CARD_FIELDS):
+                            continue
                     self._delete_cell(pos)
                     priority = 0 if row_first <= r <= row_last else 1
                     self._draw(pos, item, priority)

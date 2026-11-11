@@ -25,7 +25,8 @@ import config  # noqa: E402
 from database.db_manager import Database  # noqa: E402
 from metadata import metadata_service  # noqa: E402
 from metadata.cinemeta_service import _to_result  # noqa: E402
-from scanner.library_scanner import scan  # noqa: E402
+from scanner import library_scanner  # noqa: E402
+from scanner.library_scanner import MediaItem, scan  # noqa: E402
 from tools.make_test_library import build  # noqa: E402
 from utils import image_utils, title_parser as tp  # noqa: E402
 from utils import organizer  # noqa: E402
@@ -191,6 +192,13 @@ def parse_checks() -> None:
     check("metadata clean_query removes release tags",
           metadata_service.MetadataService.clean_query(
               "The.Matrix.1999.1080p.BluRay.x264-GROUP", 1999) == "The Matrix")
+    title, year = tp.parse_title_and_year("Blade Runner 2049")
+    check("a future year stays in the title", title == "Blade Runner 2049"
+          and year is None)
+    check("a subtitle survives a clean up",
+          tp.clean_for_search("Star Wars - A New Hope") == "Star Wars - A New Hope")
+    check("a release group after a dash is still dropped",
+          tp.clean_for_search("Star Wars - RARBG") == "Star Wars")
     candidate = _to_result({"id": "tt8123456", "name": "Test Series"}, "series")
     check("provider search results retain their type and stable id",
           candidate.media_type == "series"
@@ -241,6 +249,15 @@ def parse_checks() -> None:
     # not zero-padded: still not an episode
     check("non-padded leading number is not an episode",
           tp.episode_numbers("10 Things I Hate About You.mkv", None) == (None, None))
+    check("a numbered movie with a year is not an episode",
+          tp.episode_numbers("300 (2006).mkv", None) == (None, None))
+    check("a zero-padded number stays an episode even with a year",
+          tp.episode_numbers("001   Puss Gets the Boot [1940].mp4", None) == (None, 1))
+    check("a title with the word sample inside is kept",
+          library_scanner._wanted("A Sampling of Love.mkv")
+          and library_scanner._wanted("The Sampler.mkv"))
+    check("a sample file is still skipped", not library_scanner._wanted("sample.mkv")
+          and not library_scanner._wanted("Movie sample 1080p.mkv"))
     # a file that holds several episodes registers all of them
     check("chained file gives both episodes",
           tp.episode_numbers_all("Prison.Break.S04E01E02.mkv", None) == [(4, 1), (4, 2)])
@@ -296,6 +313,33 @@ def true_story_checks() -> None:
           and quotes[1][0].startswith("I think"))
     check("the introduction is not a quote",
           not true_story._parse_quotes("'''A film''' is a film.\n", 5))
+
+    # the category list is capped per request - the continue token of the
+    # MediaWiki API has to be followed, or later films lose their categories
+    calls: list[dict] = []
+
+    def fake_api(params: dict) -> dict:
+        calls.append(dict(params))
+        if "clcontinue" not in params:
+            return {"continue": {"clcontinue": "tok|next"},
+                    "query": {"pages": {"1": {"title": "Argo",
+                                              "categories": [{"title": "C1"}]}}}}
+        return {"query": {"pages": {"1": {"title": "Argo",
+                                          "categories": [{"title": "C1"},
+                                                         {"title": "C2"}]}}}}
+
+    original_api = true_story._api
+    true_story._api = fake_api
+    try:
+        seen: list[tuple[int, int]] = []
+        pages = true_story._fetch_pages(
+            ["Argo"], progress=lambda d, t: seen.append((d, t)))
+    finally:
+        true_story._api = original_api
+    check("category paging follows continue",
+          len(calls) == 2 and calls[1].get("clcontinue") == "tok|next"
+          and [c["title"] for c in pages["Argo"]["categories"]] == ["C1", "C2"]
+          and seen and seen[-1] == (1, 1))
 
 
 def backup_checks(target: Path) -> None:
@@ -627,7 +671,7 @@ def scanner_db_checks(target: Path) -> None:
     check("the undo journal holds the renames",
           len(organizer.load_undo()) == len(moved))
     back = organizer.undo_episode_renames(organizer.load_undo())
-    check("the renames were taken back", back == len(moved))
+    check("the renames were taken back", len(back) == len(moved))
     db.rename_episodes([(str(entry.target), str(entry.source)) for entry in moved])
     organizer.clear_undo()
     check("a taken-back library is as before",
@@ -739,6 +783,162 @@ def scanner_db_checks(target: Path) -> None:
     db.sync(items,
             {str(target / "Movies"), str(target / "Series")},
             {str(target / "Movies"), str(target / "Series")})
+
+    # --- two same-titled titles stay apart on a rescan ---
+    twin_root = target / "Twins"
+    folder84 = twin_root / "Twin (1984)"
+    folder21 = twin_root / "Twin (2021)"
+    folder84.mkdir(parents=True, exist_ok=True)
+    folder21.mkdir(parents=True, exist_ok=True)
+    (folder84 / "Twin (1984).mkv").write_bytes(b"x")
+    (folder21 / "Twin (2021).mkv").write_bytes(b"x")
+
+    def twin_item(folder: Path, year: int) -> MediaItem:
+        return MediaItem(path=str(folder), title="Twin", media_type="movie",
+                         year=year, root=str(twin_root),
+                         video_path=str(folder / f"Twin ({year}).mkv"),
+                         poster_path=None, poster2_path=None, mtime=None)
+
+    db.sync([twin_item(folder84, 1984), twin_item(folder21, 2021)],
+            {str(target / "Movies"), str(target / "Series"), str(twin_root)},
+            {str(twin_root)})
+    twins = [r for r in db.load_all() if r["title"] == "Twin"]
+    check("two same-titled titles are indexed", len(twins) == 2)
+    row84 = next(r for r in twins if r["path"] == str(folder84))
+    db.save_metadata(row84["id"], {"plot": "The 1984 one", "genres": ["Drama"]})
+    # both folders are renamed and the video names no longer match the
+    # old rows, so only the title fallback can carry the rows across -
+    # and it has to tell the two same-titled rows apart
+    renamed_twin_items = [
+        twin_item(twin_root / "Twin A", 1984),
+        twin_item(twin_root / "Twin B", 2021),
+    ]
+    db.sync(renamed_twin_items,
+            {str(target / "Movies"), str(target / "Series"), str(twin_root)},
+            {str(twin_root)})
+    rows = [r for r in db.load_all() if r["title"] == "Twin"]
+    check("two same-titled renames keep two rows", len(rows) == 2)
+    kept = [r for r in rows if r["plot"] == "The 1984 one"]
+    check("a same-titled rename keeps its own metadata",
+          len(kept) == 1 and kept[0]["year"] == 1984
+          and next(r for r in rows if r["year"] == 1984)["path"] == str(twin_root / "Twin A"))
+
+    # --- a series is "never watched" through its episodes ---
+    eps_w = db.episodes(series_id)
+    previous_watched = [(e["path"], e["watched"]) for e in eps_w]
+    db.conn.execute("UPDATE episodes SET watched=0 WHERE series_id=?", (series_id,))
+    db.conn.commit()
+    check("a series without watched episodes is never watched",
+          any(i["id"] == series_id for i in db.health_items("watched")))
+    db.conn.execute(
+        "UPDATE episodes SET watched=1 WHERE series_id=? AND path=?",
+        (series_id, previous_watched[0][0]))
+    db.conn.commit()
+    check("one watched episode makes the series watched",
+          all(i["id"] != series_id for i in db.health_items("watched")))
+    for watched_path, watched_flag in previous_watched:
+        db.set_episode_watched(watched_path, bool(watched_flag))
+
+    # --- the library size counts the video files of a series ---
+    size_root = target / "Sizes"
+    size_folder = size_root / "Big Show"
+    size_folder.mkdir(parents=True, exist_ok=True)
+    (size_folder / "Big Show S01E01.mkv").write_bytes(b"x" * 500)
+    (size_folder / "Big Show S01E02.mkv").write_bytes(b"x" * 300)
+    size_db = Database(target / "sizes.db")
+    size_db.sync(scan(size_root, None), {str(size_root)}, {str(size_root)})
+    total, missing = size_db.disk_report()
+    check("series episodes count into the library size", total == 800)
+    check("a present series is not missing", missing == [])
+    shutil.rmtree(size_root)
+    total, missing = size_db.disk_report()
+    check("a gone series is reported missing", len(missing) == 1 and total == 0)
+    size_db.close()
+
+    # --- relinking into the other configured root follows the root ---
+    cross_root = target / "CrossRoot"
+    cross_folder = cross_root / "Relinked (2001)"
+    cross_folder.mkdir(parents=True, exist_ok=True)
+    (cross_folder / "Relinked (2001).mkv").write_bytes(b"x")
+    cross_items = scan(cross_root, None)
+    db.sync(cross_items,
+            {str(target / "Movies"), str(target / "Series"), str(cross_root)},
+            {str(cross_root)})
+    relinked = next(r for r in db.load_all() if r["title"] == "Relinked")
+    check("a relinked row starts in its own root",
+          relinked["root"] == str(cross_root))
+    old_movies_dir, old_series_dir = config.MOVIES_DIR, config.SERIES_DIR
+    try:
+        config.MOVIES_DIR = target / "Movies"
+        config.SERIES_DIR = target / "Series"
+        dest = target / "Movies" / "Relinked (2001)"
+        dest.mkdir(exist_ok=True)
+        db.relink(relinked["id"], str(dest), str(dest / "Relinked (2001).mkv"))
+        after = db.get(relinked["id"])
+        check("a relink into another root follows the root",
+              after is not None
+              and after["root"] == str(target / "Movies")
+              and after["path"] == str(dest))
+    finally:
+        config.MOVIES_DIR, config.SERIES_DIR = old_movies_dir, old_series_dir
+
+    # --- the scan signature notices changes inside nested folders ---
+    from scanner import scan_state
+    sig_root = target / "SigRoot"
+    sig_season = sig_root / "Show" / "Season 1"
+    sig_season.mkdir(parents=True, exist_ok=True)
+    (sig_season / "Show S01E01.mkv").write_bytes(b"x")
+    before_sig = scan_state.root_signature(sig_root)
+    time.sleep(0.02)
+    (sig_season / "Show S01E02.mkv").write_bytes(b"x")
+    check("a nested change changes the scan signature",
+          before_sig is not None
+          and before_sig != scan_state.root_signature(sig_root))
+    saved_state_path = scan_state.STATE_PATH
+    try:
+        scan_state.STATE_PATH = target / "scan_state.json"
+        scan_state.invalidate()
+        check("an invalidated scan state is empty",
+              scan_state.load_scan_state() == {})
+    finally:
+        scan_state.STATE_PATH = saved_state_path
+
+    # --- loose videos in one folder get their own artwork ---
+    loose_root = target / "Loose"
+    loose_root.mkdir(exist_ok=True)
+    (loose_root / "Alpha (1999).mkv").write_bytes(b"x")
+    (loose_root / "Beta (2001).mkv").write_bytes(b"x")
+    (loose_root / "Alpha (1999)-poster.jpg").write_bytes(b"x")
+    loose_items = scan(loose_root, None)
+    alpha = next(i for i in loose_items if i.title == "Alpha")
+    beta = next(i for i in loose_items if i.title == "Beta")
+    check("a loose video uses its own artwork",
+          alpha.poster_path is not None
+          and Path(alpha.poster_path).name == "Alpha (1999)-poster.jpg")
+    check("a loose video does not take another's poster",
+          beta.poster_path is None)
+    single_root = target / "LooseSingle"
+    single_root.mkdir(exist_ok=True)
+    (single_root / "Gamma (2010).mkv").write_bytes(b"x")
+    (single_root / "poster.jpg").write_bytes(b"x")
+    single = next(i for i in scan(single_root, None))
+    check("a lone loose video keeps the folder's poster",
+          single.poster_path is not None
+          and Path(single.poster_path).name == "poster.jpg")
+
+    # restore the canonical library rows for the checks that follow
+    db.sync(items,
+            {str(target / "Movies"), str(target / "Series")},
+            {str(target / "Movies"), str(target / "Series")})
+
+    # --- a folder of numbered movies is not a series ---
+    coll_root = target / "Collection"
+    coll_root.mkdir(exist_ok=True)
+    (coll_root / "300 (2006).mkv").write_bytes(b"x")
+    (coll_root / "101 Dalmatians.mkv").write_bytes(b"x")
+    coll_items = scan(coll_root, None)
+    coll = next((i for i in coll_items if i.media_type == "movie"), None)
+    check("a collection of numbered movies is not a series", coll is not None)
 
     # --- a flat series without season folders gets season 1 ---
     flat_root = target / "Flat"
@@ -1359,6 +1559,18 @@ def ui_checks(target: Path) -> None:
             root.update()
             check("details visible", app._details.winfo_ismapped())
 
+            # a new title must reset the panel's cached backdrop, or the
+            # panel shows the previous title's picture behind its widgets
+            backdrop_before = app._details._backdrop_source
+            movie_item = next(i for i in app._all_items
+                              if i["media_type"] == "movie")
+            app._open_item(movie_item)
+            root.update()
+            check("a new title resets the panel's backdrop",
+                  app._details._backdrop_source != backdrop_before)
+            app._open_item(series_item)
+            root.update()
+
             # the episode panel keeps the open season across a rebuild
             app._details.show(series_item)
             root.update()
@@ -1722,9 +1934,11 @@ def ui_checks(target: Path) -> None:
             root.update()
             app._surprise_me()
             root.update()
-            check("the surprise button opens a movie",
+            # a surprise pick is any unwatched title - a series is a
+            # legitimate result, so the pick is checked, not its kind
+            check("the surprise button opens an unwatched title",
                   app._details.winfo_ismapped()
-                  and app._details._item.get("media_type") == "movie")
+                  and not app._details._item.get("seen"))
 
             # the library health tab
             # an empty folder says so and offers to fill it
@@ -1753,6 +1967,38 @@ def ui_checks(target: Path) -> None:
             check("the context menu closes itself", not menu.winfo_exists())
             check("the context menu lets go of the app",
                   root.grab_current() is None)
+
+            # a mixed selection gets one entry per kind, not one for all
+            from ui.dialogs import PopupMenu
+            all_rows = app._db.load_all()
+            movie_row = next(r for r in all_rows if r["media_type"] == "movie")
+            series_row = next(r for r in all_rows if r["media_type"] == "series")
+            original_selected = app._library.selected_items
+            app._library.selected_items = (
+                lambda: [dict(movie_row), dict(series_row)])
+            try:
+                before = list(app.winfo_children())
+                app._show_context_menu(dict(movie_row), 420, 320)
+                root.update()
+                popups = [w for w in app.winfo_children()
+                          if w not in before and isinstance(w, PopupMenu)]
+                texts = []
+                if popups:
+                    texts = [str(label.cget("text"))
+                             for frame in popups[0].winfo_children()
+                             for label in frame.winfo_children()
+                             if isinstance(label, tk.Label)]
+                    popups[0].destroy()
+                    root.update()
+                check("a mixed selection gets one entry per kind",
+                      any(t.startswith("Mark all episodes watched")
+                          for t in texts)
+                      and any(t == "Mark as Watched" for t in texts))
+                check("the mixed menu lets go of the app",
+                      root.grab_current() is None)
+            finally:
+                app._library.selected_items = original_selected
+                root.update()
 
             app._open_settings()
             root.update()
@@ -2140,6 +2386,14 @@ def ui_checks(target: Path) -> None:
     def bulk_stage() -> None:
         """Stopping a bulk fetch must not start new items."""
         try:
+            # a filter request from the details view has to reach the top bar
+            app._details._dispatch_filter("genre", "Drama")
+            root.update()
+            check("a details filter request sets the chip",
+                  app._chip_kind == "genre" and app._chip_value == "Drama"
+                  and app._chip_label.cget("text") == "Drama")
+            app._clear_chip()
+            root.update()
             state = {"attempts": []}
 
             class SlowProvider(metadata_service.MetadataService):
@@ -2171,6 +2425,44 @@ def ui_checks(target: Path) -> None:
     def check_bulk(state, items) -> None:
         check("stopping a bulk fetch does not start new items",
               0 < len(state["attempts"]) < len(items))
+        check("the settings view reports fetched items",
+              app._settings._on_changed == app._on_items_fetched)
+        bulk_run_stage(state)
+
+    def bulk_run_stage(state) -> None:
+        """A finished bulk fetch must leave the pool and the list reusable."""
+        try:
+            state["attempts"] = []
+            batch = [dict(i) for i in app._settings._db.get_unfetched()[:5]]
+            app._settings._fetch_items(batch)
+            root.after(800, lambda: check_bulk_run(state, batch))
+        except Exception as exc:
+            print(f"[FAIL] bulk run smoke raised {exc!r}")
+            import traceback
+            traceback.print_exc()
+            finish()
+
+    def check_bulk_run(state, batch) -> None:
+        check("a bulk fetch run completes",
+              len(state["attempts"]) == len(batch)
+              and not app._settings._bulk_running
+              and str(app._settings._bulk_status.cget("text"))
+              .startswith("Fetch complete"))
+        check("a completed bulk fetch drops its rows",
+              all(str(i["id"]) not in app._settings._bulk_tree.get_children()
+                  for i in batch))
+        state["attempts"] = []
+        batch = [dict(i) for i in app._settings._db.get_unfetched()[:5]]
+        app._settings._fetch_items(batch)
+        root.after(800, lambda: check_second_bulk_run(state, batch))
+
+    def check_second_bulk_run(state, batch) -> None:
+        # the fetch pool used to die after its first shutdown
+        check("a second bulk fetch run completes",
+              len(state["attempts"]) == len(batch)
+              and not app._settings._bulk_running
+              and str(app._settings._bulk_status.cget("text"))
+              .startswith("Fetch complete"))
         finish()
 
     finished = {"closed": False}

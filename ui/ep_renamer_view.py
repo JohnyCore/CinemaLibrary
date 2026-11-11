@@ -192,12 +192,14 @@ class EpRenamerView(tk.Frame):
 
         def worker() -> None:
             try:
+                # the journal is written before the files move: a crash in
+                # the middle of a run must still leave a way back
+                organizer.save_undo([
+                    (str(e.source), str(e.target)) for e in todo])
                 organizer.rename_episode_files(todo)
-                moves = [(e.source, e.target) for e in todo if e.result == "renamed"]
-                db_moves = [(str(old), str(new)) for old, new in moves]
-                self._db.rename_episodes(db_moves)
-                if moves:
-                    organizer.save_undo(db_moves)
+                moves = [(str(e.source), str(e.target)) for e in todo
+                         if e.result == "renamed"]
+                self._db.rename_episodes(moves)
             except Exception:
                 log.exception("the renames could not be saved")
                 self._post(self._failed)
@@ -238,15 +240,23 @@ class EpRenamerView(tk.Frame):
 
         def worker() -> None:
             try:
-                back = organizer.undo_episode_renames(moves)
-                self._db.rename_episodes(
-                    [(str(new), str(old)) for old, new in moves])
-                organizer.clear_undo()
+                undone = organizer.undo_episode_renames(moves)
+                # only the database rows of files that really moved back -
+                # a failed file undo must not un-tell the database
+                if undone:
+                    self._db.rename_episodes(
+                        [(str(new), str(old)) for old, new in undone])
+                if len(undone) == len(moves):
+                    organizer.clear_undo()
+                else:
+                    # the moves that are still in place stay undoable
+                    organizer.save_undo(
+                        [m for m in moves if m not in undone])
             except Exception:
                 log.exception("the undo could not be saved")
                 self._post(self._failed)
                 return
-            self._post(lambda: self._undone(back, len(moves)))
+            self._post(lambda: self._undone(len(undone), len(moves)))
 
         threading.Thread(target=self._db.thread_target(worker), daemon=True).start()
 

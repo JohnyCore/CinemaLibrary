@@ -19,6 +19,7 @@ from pathlib import Path
 
 import config
 from utils import title_parser as tp
+from utils.path_utils import atomic_write_text
 
 log = logging.getLogger(__name__)
 
@@ -28,7 +29,9 @@ _YEAR = re.compile(r"(?<!\d)((?:19|20)\d{2})(?!\d)")
 # the quality of a release: "Memento 2000 1080p"
 _QUALITY = re.compile(r"\b(2160p|1080p|720p|480p)\b", re.IGNORECASE)
 # the release group at the end of a scene name: "-GROUP"
-_GROUP_SUFFIX = re.compile(r"\s-\s?[^-]{1,40}$")
+# a dash suffix is a release group only when it is one token without
+# spaces ("Movie - RARBG"); a real subtitle keeps its words
+_GROUP_SUFFIX = re.compile(r"\s-\s?\S{1,40}$")
 # cutting a name at its year leaves the opening bracket behind
 _OPEN_BRACKET = re.compile(r"[\(\[\{]+\s*$")
 
@@ -80,9 +83,12 @@ def _clean(text: str) -> str:
 def _split_year(text: str) -> tuple[str, int | None]:
     """The name before its year and the year itself.
 
-    A year at the very start belongs to the title ("2001: A Space Odyssey").
+    A year at the very start belongs to the title ("2001: A Space Odyssey"),
+    and so does a future year ("Blade Runner 2049").
     """
-    found = [m for m in _YEAR.finditer(text) if m.start() > 0]
+    limit = tp._RELEASE_YEAR_MAX
+    found = [m for m in _YEAR.finditer(text)
+             if m.start() > 0 and int(m.group(1)) <= limit]
     if not found:
         return text, None
     match = found[-1]
@@ -353,6 +359,11 @@ def rename_episode_files(entries: list[EpisodeRename]) -> int:
     for entry in entries:
         if entry.result:
             continue
+        # two planned renames can aim at one name, and Path.rename would
+        # silently overwrite an existing file on POSIX
+        if entry.target.exists():
+            entry.result = "name taken - left alone"
+            continue
         try:
             entry.source.rename(entry.target)
             entry.result = "renamed"
@@ -366,10 +377,8 @@ def rename_episode_files(entries: list[EpisodeRename]) -> int:
 def save_undo(moves: list[tuple[str, str]]) -> None:
     """Remember the last applied rename so it can be taken back."""
     try:
-        _UNDO_PATH.parent.mkdir(parents=True, exist_ok=True)
-        _UNDO_PATH.write_text(json.dumps(
-            {"moves": [{"old": old, "new": new} for old, new in moves]}),
-            encoding="utf-8")
+        atomic_write_text(_UNDO_PATH, json.dumps(
+            {"moves": [{"old": old, "new": new} for old, new in moves]}))
     except OSError as exc:
         log.warning("could not write %s: %s", _UNDO_PATH, exc)
 
@@ -391,15 +400,20 @@ def clear_undo() -> None:
         pass
 
 
-def undo_episode_renames(moves: list[tuple[str, str]]) -> int:
-    """Put the renamed files back to their old names. Returns how many."""
-    back = 0
+def undo_episode_renames(
+        moves: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """Put the renamed files back to their old names.
+
+    Returns the moves that were taken back - a move whose file could not
+    be undone stays out, so the caller does not un-tell the database.
+    """
+    back: list[tuple[str, str]] = []
     for old, new in moves:
         try:
             new_path, old_path = Path(new), Path(old)
             if new_path.exists() and not old_path.exists():
                 new_path.rename(old_path)
-                back += 1
+                back.append((old, new))
         except OSError as exc:
             log.warning("could not undo the rename %s: %s", new, exc)
     return back

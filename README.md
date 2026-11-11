@@ -115,7 +115,9 @@ do not navigate away from the details view.
 - Video formats: `.mkv .mp4 .avi .mov .wmv .m4v .ts`
 - Artwork: `poster.*` and `poster2.*` (also `fanart`/`backdrop` for the
   background), case-insensitive, optionally inside an `artwork`/`posters`
-  subfolder.
+  subfolder. A loose video file that shares its folder with another video
+  gets its own artwork named `<video stem>-poster.*` / `<video stem>-poster2.*`;
+  a lone loose video still uses the folder's artwork.
 - Folders without media, inaccessible folders and malformed files are skipped
   with a log entry, not a crash.
 
@@ -170,6 +172,14 @@ media file is ever moved:
 
 Folders live in the app database (`collections` table), so a rescan of your
 media folders never touches them.
+
+## Rescanning
+
+**Rescan Library** first checks a snapshot of every folder's file timestamps
+and sizes. When nothing changed it says so in the status bar
+(*Library up to date*) and skips the walk — click **Rescan Library** again
+right away to force a full scan anyway. A scan always runs after adding or
+changing library folders, restoring a backup, or relinking a title.
 
 ## Searching
 

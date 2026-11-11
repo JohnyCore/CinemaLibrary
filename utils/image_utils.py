@@ -10,6 +10,7 @@ LANCZOS = getattr(Image, "Resampling", Image).LANCZOS
 
 _BACKDROP_STEMS = ("poster2", "fanart", "backdrop")
 _ART_SUBDIRS = {"artwork", "extrafanart", "images", "posters", "fanart", "art"}
+_VIDEO_EXTS = {".mkv", ".mp4", ".avi", ".mov", ".wmv", ".m4v", ".ts"}
 _LETTERBOX_BG = (16, 19, 25)
 # Cache for letterbox background images to avoid GC pressure during scroll
 _LETTERBOX_CACHE: dict[tuple[int, int], Image.Image] = {}
@@ -36,6 +37,53 @@ def _find(names: dict[str, os.DirEntry], stem: str) -> Path | None:
         if entry is not None and entry.is_file():
             return Path(entry.path)
     return None
+
+
+def find_video_artwork(
+    video: Path, cache: dict | None = None
+) -> tuple[Path | None, Path | None]:
+    """Artwork named after a loose video file: "<stem>-poster.jpg" etc.
+
+    A bare video in a folder that holds several videos must not use the
+    folder's poster.jpg - that file belongs to whichever title was
+    fetched first.
+    """
+    names = _dir_map(video.parent, cache)
+    stem = video.stem.lower()
+    poster = _find(names, f"{stem}-poster")
+    backdrop = (_find(names, f"{stem}-poster2")
+                or _find(names, f"{stem}-fanart")
+                or _find(names, f"{stem}-backdrop"))
+    return poster, backdrop
+
+
+def find_item_artwork(
+    video_or_folder: Path, cache: dict | None = None
+) -> tuple[Path | None, Path | None]:
+    """Artwork for a media item, loose videos included.
+
+    A folder item uses the folder's artwork. A loose video file uses its
+    own "<stem>-poster" artwork when it shares its folder with another
+    video, and the folder's artwork when it is the only one.
+    """
+    try:
+        if not video_or_folder.is_file():
+            return find_artwork(video_or_folder, cache)
+    except OSError:
+        return None, None
+    names = _dir_map(video_or_folder.parent, cache)
+    others = any(
+        entry.is_file()
+        and entry.name.lower() != video_or_folder.name.lower()
+        and Path(entry.name).suffix.lower() in _VIDEO_EXTS
+        for entry in names.values()
+    )
+    if others:
+        poster, backdrop = find_video_artwork(video_or_folder, cache)
+        if poster is not None or backdrop is not None:
+            return poster, backdrop
+        return None, None
+    return find_artwork(video_or_folder.parent, cache)
 
 
 def find_artwork(

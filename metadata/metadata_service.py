@@ -1,20 +1,96 @@
 from __future__ import annotations
 
+import ipaddress
 import logging
+import queue
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping
-from urllib.request import Request, urlopen
+from typing import Any, Callable, Mapping
+from urllib.parse import urlsplit
+from urllib.request import (
+    HTTPRedirectHandler, ProxyHandler, Request, build_opener, urlopen)
 
+
+from utils import media_ops
 from utils import title_parser
 
 log = logging.getLogger(__name__)
 
 _USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                "AppleWebKit/537.36 CinemaLibrary")
+
+CINEMETA_ART_HOSTS = frozenset({
+    "images.metahub.space", "images.strem.io", "upload.wikimedia.org",
+})
+MAX_ART_BYTES = 12 * 1024 * 1024
+MAX_ART_PIXELS = 25_000_000
+_ART_TIMEOUT = 20
+
+
+def validated_art_url(url: str | None) -> str | None:
+    """Only allowlisted artwork hosts may be downloaded from."""
+    if not url:
+        return None
+    try:
+        parts = urlsplit(url)
+        if (
+            parts.scheme != "https"
+            or parts.hostname not in CINEMETA_ART_HOSTS
+            or parts.username is not None
+            or parts.password is not None
+            or parts.port not in (None, 443)
+        ):
+            return None
+    except ValueError:
+        return None
+    return url
+
+
+def are_public_art_addresses(addresses: list[str]) -> bool:
+    """Artwork must come from a public address - no private or reserved IPs."""
+    if not addresses:
+        return False
+    try:
+        return all(ipaddress.ip_address(address).is_global for address in addresses)
+    except ValueError:
+        return False
+
+
+class NoRedirect(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_ART_OPENER = build_opener(ProxyHandler({}), NoRedirect())
+
+
+class DaemonPool:
+    """A pool of daemon threads - an idle fetch must not hold the app open."""
+
+    def __init__(self, size: int = 4) -> None:
+        self._tasks: "queue.SimpleQueue[Callable[[], None]]" = queue.SimpleQueue()
+        self._threads = [
+            threading.Thread(
+                target=self._run, daemon=True, name=f"metadata-fetch-{index}",
+            )
+            for index in range(max(1, size))
+        ]
+        for thread in self._threads:
+            thread.start()
+
+    def _run(self) -> None:
+        while True:
+            task = self._tasks.get()
+            try:
+                task()
+            except Exception:
+                log.exception("metadata fetch worker failed")
+
+    def submit(self, task: Callable[[], None]) -> None:
+        self._tasks.put(task)
 
 
 class MetadataError(RuntimeError):
@@ -170,7 +246,6 @@ def write_about(media: Mapping[str, Any], result: MetadataResult) -> str | None:
     folder = base.parent if base.is_file() and base.suffix else base
     if not folder.is_dir():
         return None
-
     def line(label: str, value) -> str:
         text = ", ".join(str(v) for v in value) if isinstance(value, (list, tuple)) else str(value or "")
         return f"{label}: {text.strip()}\n" if text.strip() else ""
@@ -191,7 +266,7 @@ def write_about(media: Mapping[str, Any], result: MetadataResult) -> str | None:
         line("Release date", result.release_date),
         line("IMDb", result.imdb_id),
     ])
-    target = folder / "about.txt"
+    target = folder / f"{media_ops.artwork_prefix(media)}about.txt"
     try:
         target.write_text(body, encoding="utf-8")
     except OSError as exc:
@@ -214,16 +289,19 @@ def download_artwork(
     """
     base = Path(str(media.get("video_path") or media.get("path")))
     folder = base.parent if base.is_file() and base.suffix else base
+    # a loose video that shares its folder names its artwork after the
+    # file, so two bare movies in one folder do not overwrite each other
+    prefix = media_ops.artwork_prefix(media)
     downloaded: dict[str, str] = {}
     for kind, url in (("poster", poster_url), ("poster2", backdrop_url)):
         if not url:
             continue
-        if not overwrite and any(folder.glob(f"{kind}.*")):
+        if not overwrite and any(folder.glob(f"{prefix}{kind}.*")):
             continue
-        target = folder / f"{kind}.jpg"
+        target = folder / f"{prefix}{kind}.jpg"
         # every download gets its own temp file: two items in one folder
         # must not write into the same file
-        tmp = folder / f".{kind}.{uuid.uuid4().hex[:8]}.part"
+        tmp = folder / f".{prefix}{kind}.{uuid.uuid4().hex[:8]}.part"
         try:
             req = Request(url, headers={"User-Agent": _USER_AGENT})
             with urlopen(req, timeout=30) as resp, open(tmp, "wb") as fh:

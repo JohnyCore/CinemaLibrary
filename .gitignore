@@ -9,3 +9,5 @@ graphify-out/
 docs/
 tests/
 archive/
+build/
+dist/

@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable
 
 from utils import title_parser as tp
-from utils.image_utils import find_artwork
+from utils.image_utils import find_artwork, find_item_artwork
 from utils.path_utils import canonical_path
 
 log = logging.getLogger(__name__)
@@ -19,6 +20,10 @@ _SKIP_DIRS = {
     "sample", "samples", "extras", "featurettes", "proof", "screens",
     "subs", "subtitles", "bonus", "trailers",
 }
+
+# a folder or file is only junk when "sample" is its own word - "Sampling"
+# and titles with the word inside stay in the library
+_SAMPLE_RE = re.compile(r"(?i)\bsamples?\b")
 
 MAX_DEPTH = 4
 
@@ -113,7 +118,7 @@ def _is_video(name: str) -> bool:
 
 def _wanted(name: str) -> bool:
     n = name.lower()
-    return not n.startswith(".") and "sample" not in n
+    return not n.startswith(".") and not _SAMPLE_RE.search(n)
 
 
 def _root_entries(root: Path | None) -> "tuple[list[Path], bool]":
@@ -208,7 +213,13 @@ def _has_tv_shape(scan: FolderScan) -> bool:
     # the numbers of an episode list are unique - two files with the same
     # number are two versions of one file, not two episodes
     numbers = [e.episode for e in bare]
-    return len(set(numbers)) == len(numbers)
+    if len(set(numbers)) != len(numbers):
+        return False
+    # and they run from their first number: 1..N, or the tail of a long
+    # series (99, 100, 101). Numbered movies ("300", "101 Dalmatians")
+    # collected in one folder are not contiguous
+    ordered = sorted(numbers)
+    return ordered == list(range(ordered[0], ordered[0] + len(ordered)))
 
 
 def _children(folder: Path, cache: dict | None = None) -> list[Path]:
@@ -368,7 +379,9 @@ def _pick_main_video(folder: Path, videos: list) -> tuple:
 
 def _movie_from_file(file: Path, root: str, cache: dict) -> MediaItem | None:
     title, year = _named_title(file.stem)
-    poster, backdrop = find_artwork(file.parent, cache)
+    # a loose video next to other loose videos gets its own artwork
+    # ("Casablanca-poster.jpg"), not the folder's shared poster.jpg
+    poster, backdrop = find_item_artwork(file, cache)
     return MediaItem(
         path=str(file),
         title=title or file.stem,

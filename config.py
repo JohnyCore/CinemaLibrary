@@ -11,6 +11,8 @@ import time
 import zipfile
 from pathlib import Path, PurePosixPath
 
+from utils.path_utils import atomic_write_text
+
 log = logging.getLogger(__name__)
 
 APP_DIR = Path(__file__).resolve().parent
@@ -82,7 +84,8 @@ def save_settings(settings: dict) -> bool:
     """Write the settings file. Returns False when the write failed."""
     merged = {**load_settings(), **settings}
     try:
-        SETTINGS_PATH.write_text(json.dumps(merged, indent=2) + "\n", encoding="utf-8")
+        atomic_write_text(
+            SETTINGS_PATH, json.dumps(merged, indent=2) + "\n")
     except OSError as exc:
         log.error("could not write %s: %s", SETTINGS_PATH, exc)
         return False
@@ -318,8 +321,8 @@ def init() -> None:
     _apply(settings)
     if not SETTINGS_PATH.exists():
         try:
-            SETTINGS_PATH.write_text(
-                json.dumps(DEFAULT_SETTINGS, indent=2) + "\n", encoding="utf-8"
+            atomic_write_text(
+                SETTINGS_PATH, json.dumps(DEFAULT_SETTINGS, indent=2) + "\n"
             )
         except OSError:
             pass

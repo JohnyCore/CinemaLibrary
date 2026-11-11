@@ -11,6 +11,8 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import TypeVar
 
+import config
+
 from utils.path_utils import canonical_path
 
 log = logging.getLogger(__name__)
@@ -176,25 +178,28 @@ LEFT JOIN (
 ) ep ON ep.series_id = m.id
 """
 
-_UPSERT_MEDIA = """
-INSERT INTO media (
-    path, title, media_type, year, root, video_path, poster_path, poster2_path,
-    mtime, last_scanned, added_at
-)
+# a renamed item keeps its fetched metadata: only the filesystem-derived
+# columns are overwritten, and the title stays when the provider set it
+_UPDATE_RENAMED_MEDIA = """
+UPDATE media SET
+    path=?, title=?, media_type=?, year=?, root=?, video_path=?,
+    poster_path=?, poster2_path=?, mtime=?, last_scanned=?,
+    added_at=COALESCE(added_at, ?)
+WHERE id=?
+"""
+
+_UPDATE_REFRESH_MEDIA = """
+UPDATE media SET
+    title=?, media_type=?, year=?, root=?, video_path=?,
+    poster_path=?, poster2_path=?, mtime=?, last_scanned=?,
+    added_at=COALESCE(added_at, ?)
+WHERE id=?
+"""
+
+_INSERT_NEW_MEDIA = """
+INSERT INTO media (path, title, media_type, year, root, video_path,
+                   poster_path, poster2_path, mtime, last_scanned, added_at)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-ON CONFLICT(path) DO UPDATE SET
-    title = CASE WHEN media.from_provider = 1
-                 THEN media.title ELSE excluded.title END,
-    media_type = excluded.media_type,
-    year = CASE WHEN media.from_provider = 1
-                THEN COALESCE(media.year, excluded.year) ELSE excluded.year END,
-    root = excluded.root,
-    video_path = excluded.video_path,
-    poster_path = COALESCE(excluded.poster_path, media.poster_path),
-    poster2_path = COALESCE(excluded.poster2_path, media.poster2_path),
-    mtime = excluded.mtime,
-    last_scanned = excluded.last_scanned,
-    added_at = COALESCE(media.added_at, excluded.added_at)
 """
 
 # watched / last_watched are deliberately absent from the DO UPDATE set:
@@ -216,17 +221,6 @@ _INSERT_EPISODE = """
 INSERT INTO episodes(series_id, season, episode, name, released, summary,
                      name_from_provider, path, watched, last_watched)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-"""
-
-# a renamed item keeps the metadata that was fetched for it
-_CARRY_MEDIA = """
-UPDATE media SET
-    title=?, year=?, from_provider=?,
-    imdb_id=?, plot=?, genres=?, rating=?, runtime=?, director=?, writer=?,
-    cast_list=?, country=?, watched=?, last_watched=?, collection_id=?,
-    poster_path=COALESCE(?, poster_path), poster2_path=COALESCE(?, poster2_path),
-    true_story=?, true_story_article=?, my_rating=?, quotes=?
-WHERE path=?
 """
 
 _SELECT_EXISTING = """
@@ -539,15 +533,22 @@ class Database:
     # --- duplicates ---------------------------------------------------
 
     def duplicate_groups(self) -> list[dict]:
-        """The titles that more than one item carries."""
+        """The titles that more than one item carries.
+
+        Copies of one title share the name, the year and the kind - a
+        remake, or a movie and a series of the same name, are not the same
+        title twice.
+        """
         rows = self.conn.execute(
             "SELECT id, path, title, year, media_type, poster_path, poster2_path, "
             "imdb_id, plot, genres, rating, runtime, director, writer, cast_list, "
             "country, watched FROM media ORDER BY title COLLATE NOCASE, path"
         ).fetchall()
-        groups: dict[str, list[dict]] = {}
+        groups: dict[tuple, list[dict]] = {}
         for row in rows:
-            groups.setdefault(str(row["title"] or "").lower(), []).append(dict(row))
+            key = (str(row["title"] or "").lower(),
+                   row["year"], row["media_type"])
+            groups.setdefault(key, []).append(dict(row))
         return [{"title": items[0].get("title") or "", "items": items}
                 for items in groups.values() if len(items) > 1]
 
@@ -564,6 +565,21 @@ class Database:
             return new + value[len(old):]
         return value
 
+    @staticmethod
+    def _root_for(path: str) -> str | None:
+        """The configured media root that contains a path, if there is one."""
+        target = canonical_path(path)
+        for root in (config.MOVIES_DIR, config.SERIES_DIR):
+            if root is None:
+                continue
+            base = canonical_path(str(root)).rstrip("\\/") or canonical_path(str(root))
+            if not base:
+                continue
+            if target == base or target.startswith(base + os.sep) \
+                    or target.startswith(base + "/"):
+                return str(root)
+        return None
+
     def relink(self, media_id: int, new_path: str,
                new_video: str | None = None) -> bool:
         """Point an item at a new place on the disk.
@@ -572,6 +588,10 @@ class Database:
         series, the file of a loose movie), `new_video` the video file
         inside it. Everything that lived in the old folder - the episodes,
         the artwork - moves along.
+
+        The item's root follows the new place: a row that keeps the old
+        root would be deleted by the next scan ("outside the scanned
+        roots") or matched twice.
         """
         row = self.conn.execute("SELECT * FROM media WHERE id=?", (media_id,)).fetchone()
         if row is None:
@@ -587,15 +607,18 @@ class Database:
             old, new_path, row["video_path"])
         poster = self._rebase(old, new_path, row["poster_path"])
         poster2 = self._rebase(old, new_path, row["poster2_path"])
-        for art in (poster, poster2):
-            if art and not Path(art).exists():
-                art = None
+        # artwork that did not move along is not pointed at any more
+        if poster is not None and not Path(poster).exists():
+            poster = None
+        if poster2 is not None and not Path(poster2).exists():
+            poster2 = None
+        new_root = self._root_for(new_path)
         episodes = self.episodes(media_id)
         with self.conn:
             self.conn.execute(
-                "UPDATE media SET path=?, video_path=?, poster_path=?, poster2_path=? "
-                "WHERE id=?",
-                (new_path, video, poster, poster2, media_id),
+                "UPDATE media SET path=?, video_path=?, poster_path=?, "
+                "poster2_path=?, root=COALESCE(?, root) WHERE id=?",
+                (new_path, video, poster, poster2, new_root, media_id),
             )
             for episode in episodes:
                 moved = self._rebase(old, new_path, episode["path"])
@@ -924,6 +947,7 @@ class Database:
             self.conn.execute(
                 "UPDATE media SET imdb_id=NULL, plot=NULL, genres=NULL, rating=NULL, "
                 "runtime=NULL, director=NULL, writer=NULL, cast_list=NULL, country=NULL, "
+                "release_date=NULL, "
                 # the title belongs to the folder again
                 "from_provider=0 "
                 "WHERE id=?",
@@ -932,6 +956,11 @@ class Database:
             # the expected episode list came from the provider too
             self.conn.execute(
                 "DELETE FROM expected_episodes WHERE series_id=?", (media_id,))
+            # the names the provider filled in belong to the old metadata
+            self.conn.execute(
+                "UPDATE episodes SET name=NULL, released=NULL, summary=NULL, "
+                "name_from_provider=0 "
+                "WHERE series_id=? AND name_from_provider=1", (media_id,))
 
     def clear_poster(self, media_id: int, which: str) -> None:
         """Clear poster_path or poster2_path for an item."""
@@ -1170,6 +1199,16 @@ class Database:
 
     # --- library health ------------------------------------------------
 
+    # "never watched": a movie by its flag, a series by its episodes -
+    # media.watched is never set for series, so it must not be the test
+    _NEVER_WATCHED_MOVIES = "COALESCE(media.watched,0)=0"
+    _NEVER_WATCHED_SERIES = (
+        "NOT EXISTS (SELECT 1 FROM episodes ep "
+        "WHERE ep.series_id=media.id AND COALESCE(ep.watched,0)=1)")
+    _NEVER_WATCHED = (
+        f"WHERE CASE WHEN media.media_type='series' "
+        f"THEN {_NEVER_WATCHED_SERIES} ELSE {_NEVER_WATCHED_MOVIES} END")
+
     def health_counts(self) -> dict[str, int]:
         """How many items have which problem."""
         counts = {
@@ -1177,7 +1216,7 @@ class Database:
                 "WHERE (imdb_id IS NULL OR imdb_id='') "
                 "AND (plot IS NULL OR plot='')"),
             "poster": self._count("WHERE poster_path IS NULL OR poster_path=''"),
-            "watched": self._count("WHERE COALESCE(watched,0)=0"),
+            "watched": self._count(self._NEVER_WATCHED),
             "truestory": self._count("WHERE true_story IS NULL"),
             "gaps": self._count(
                 "WHERE media_type='series' AND EXISTS ("
@@ -1259,7 +1298,10 @@ class Database:
             ).fetchall()
         elif issue == "watched":
             rows = self.conn.execute(
-                _SELECT_MEDIA + " WHERE COALESCE(m.watched,0)=0 "
+                _SELECT_MEDIA + " WHERE CASE WHEN m.media_type='series' THEN NOT EXISTS ("
+                "  SELECT 1 FROM episodes ep "
+                "  WHERE ep.series_id=m.id AND COALESCE(ep.watched,0)=1"
+                ") ELSE COALESCE(m.watched,0)=0 END "
                 "ORDER BY m.title COLLATE NOCASE"
             ).fetchall()
         elif issue == "truestory":
@@ -1282,29 +1324,73 @@ class Database:
     def disk_report(self) -> tuple[int, list[dict]]:
         """The size of the library and the items that are gone.
 
-        One pass over the files answers both questions - the size and the
-        existence of a file are the same stat.
+        One pass answers both questions - the size and the existence of a
+        file are the same stat. A series is measured through its episode
+        files: statting the folder would only report the size of the
+        directory entry itself.
         """
-        sizes: dict[str, int] = {}
         rows = self.conn.execute(_SELECT_MEDIA).fetchall()
-        for row in rows:
-            target = row["video_path"] or row["path"]
-            if not target or target in sizes:
-                continue
-            try:
-                sizes[target] = Path(target).stat().st_size
-            except OSError:
-                sizes[target] = -1
-        total = sum(size for size in sizes.values() if size > 0)
+        episode_paths: dict[int, set[str]] = {}
+        for r in self.conn.execute("SELECT series_id, path FROM episodes"):
+            episode_paths.setdefault(r["series_id"], set()).add(r["path"])
+        total = 0
         missing = []
         for row in rows:
             item = dict(row)
+            if item.get("media_type") == "series":
+                size = self._series_disk_size(item, episode_paths.get(item["id"], ()))
+                if size is None:
+                    missing.append(item)
+                elif size > 0:
+                    total += size
+                continue
             target = item.get("video_path") or item.get("path")
             if not target:
                 continue
-            if sizes.get(target, -1) < 0:
+            try:
+                size = Path(target).stat().st_size
+            except OSError:
                 missing.append(item)
+                continue
+            if size > 0:
+                total += size
         return total, missing
+
+    @staticmethod
+    def _series_disk_size(item: dict, paths: "set[str] | list[str]") -> int | None:
+        """The size of a series' video files, or None when it is gone.
+
+        The episode rows are used when there are any; otherwise the folder
+        is walked, so a series without episode rows is measured as well.
+        """
+        folder = Path(item.get("path") or "")
+        try:
+            if not folder.is_dir():
+                return None
+        except OSError:
+            return None
+        total = 0
+        if paths:
+            for path in paths:
+                try:
+                    st = Path(path).stat()
+                except OSError:
+                    continue
+                if os.path.isfile(path) and st.st_size > 0:
+                    total += st.st_size
+            return total
+        from scanner.library_scanner import VIDEO_EXTS
+        for base, _dirs, files in os.walk(folder):
+            for name in files:
+                if Path(name).suffix.lower() not in VIDEO_EXTS:
+                    continue
+                try:
+                    st = os.stat(os.path.join(base, name))
+                except OSError:
+                    continue
+                if st.st_size > 0:
+                    total += st.st_size
+        return total
 
     def _count(self, where: str) -> int:
         row = self.conn.execute(f"SELECT COUNT(*) AS n FROM media {where}").fetchone()
@@ -1385,142 +1471,52 @@ class Database:
                 if stale:
                     conn.executemany("DELETE FROM media WHERE id=?", stale)
 
-                # Build temp table for new items to do matching in SQL
-                conn.execute("CREATE TEMP TABLE sync_new_items ("
-                             "path TEXT PRIMARY KEY, title TEXT, media_type TEXT, "
-                             "year INTEGER, root TEXT, video_path TEXT, "
-                             "poster_path TEXT, poster2_path TEXT, mtime REAL)")
-                conn.executemany(
-                    "INSERT INTO sync_new_items VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    [(i.path, i.title, i.media_type, i.year, i.root, i.video_path,
-                      i.poster_path, i.poster2_path, i.mtime) for i in items]
-                )
-
-                # Match renames in SQL: by video file name, then by title
-                conn.execute("""
-                    UPDATE media SET
-                        path = COALESCE(
-                            (SELECT n.path FROM sync_new_items n
-                             WHERE n.video_path IS NOT NULL
-                               AND media.root = n.root
-                               AND LOWER(path_name(n.video_path)) = LOWER(path_name(media.video_path))),
-                            (SELECT n.path FROM sync_new_items n
-                             WHERE media.root = n.root
-                               AND LOWER(n.title) = LOWER(media.title)),
-                            media.path),
-                        title = CASE
-                            WHEN media.from_provider = 1 THEN media.title
-                            ELSE COALESCE(
-                                (SELECT n.title FROM sync_new_items n
-                                 WHERE n.video_path IS NOT NULL
-                                   AND media.root = n.root
-                                   AND LOWER(path_name(n.video_path)) = LOWER(path_name(media.video_path))),
-                                (SELECT n.title FROM sync_new_items n
-                                 WHERE media.root = n.root
-                                   AND LOWER(n.title) = LOWER(media.title)),
-                                media.title)
-                            END,
-                        media_type = COALESCE(
-                            (SELECT n.media_type FROM sync_new_items n
-                             WHERE n.video_path IS NOT NULL
-                               AND media.root = n.root
-                               AND LOWER(path_name(n.video_path)) = LOWER(path_name(media.video_path))),
-                            (SELECT n.media_type FROM sync_new_items n
-                             WHERE media.root = n.root
-                               AND LOWER(n.title) = LOWER(media.title)),
-                            media.media_type),
-                        year = COALESCE(
-                            (SELECT n.year FROM sync_new_items n
-                             WHERE n.video_path IS NOT NULL
-                               AND media.root = n.root
-                               AND LOWER(path_name(n.video_path)) = LOWER(path_name(media.video_path))),
-                            (SELECT n.year FROM sync_new_items n
-                             WHERE media.root = n.root
-                               AND LOWER(n.title) = LOWER(media.title)),
-                            media.year),
-                        root = COALESCE(
-                            (SELECT n.root FROM sync_new_items n
-                             WHERE n.video_path IS NOT NULL
-                               AND media.root = n.root
-                               AND LOWER(path_name(n.video_path)) = LOWER(path_name(media.video_path))),
-                            (SELECT n.root FROM sync_new_items n
-                             WHERE media.root = n.root
-                               AND LOWER(n.title) = LOWER(media.title)),
-                            media.root),
-                        video_path = COALESCE(
-                            (SELECT n.video_path FROM sync_new_items n
-                             WHERE n.video_path IS NOT NULL
-                               AND media.root = n.root
-                               AND LOWER(path_name(n.video_path)) = LOWER(path_name(media.video_path))),
-                            (SELECT n.video_path FROM sync_new_items n
-                             WHERE media.root = n.root
-                               AND LOWER(n.title) = LOWER(media.title)),
-                            media.video_path),
-                        poster_path = COALESCE(
-                            (SELECT n.poster_path FROM sync_new_items n
-                             WHERE n.video_path IS NOT NULL
-                               AND media.root = n.root
-                               AND LOWER(path_name(n.video_path)) = LOWER(path_name(media.video_path))),
-                            (SELECT n.poster_path FROM sync_new_items n
-                             WHERE media.root = n.root
-                               AND LOWER(n.title) = LOWER(media.title)),
-                            media.poster_path),
-                        poster2_path = COALESCE(
-                            (SELECT n.poster2_path FROM sync_new_items n
-                             WHERE n.video_path IS NOT NULL
-                               AND media.root = n.root
-                               AND LOWER(path_name(n.video_path)) = LOWER(path_name(media.video_path))),
-                            (SELECT n.poster2_path FROM sync_new_items n
-                             WHERE media.root = n.root
-                               AND LOWER(n.title) = LOWER(media.title)),
-                            media.poster2_path),
-                        mtime = COALESCE(
-                            (SELECT n.mtime FROM sync_new_items n
-                             WHERE n.video_path IS NOT NULL
-                               AND media.root = n.root
-                               AND LOWER(path_name(n.video_path)) = LOWER(path_name(media.video_path))),
-                            (SELECT n.mtime FROM sync_new_items n
-                             WHERE media.root = n.root
-                               AND LOWER(n.title) = LOWER(media.title)),
-                            media.mtime),
-                        last_scanned = ?,
-                        added_at = COALESCE(media.added_at,
-                            (SELECT n.mtime FROM sync_new_items n
-                             WHERE n.video_path IS NOT NULL
-                               AND media.root = n.root
-                               AND LOWER(path_name(n.video_path)) = LOWER(path_name(media.video_path))),
-                            (SELECT n.mtime FROM sync_new_items n
-                             WHERE media.root = n.root
-                               AND LOWER(n.title) = LOWER(media.title)),
-                            media.added_at)
-                    WHERE EXISTS (
-                        SELECT 1 FROM sync_new_items n
-                        WHERE (n.video_path IS NOT NULL
-                               AND media.root = n.root
-                               AND LOWER(path_name(n.video_path)) = LOWER(path_name(media.video_path)))
-                           OR (media.root = n.root
-                               AND LOWER(n.title) = LOWER(media.title))
-                    )
-                """, (now,))
-
-                # Insert new items (not matched by rename)
-                conn.execute("""
-                    INSERT INTO media (path, title, media_type, year, root, video_path,
-                                       poster_path, poster2_path, mtime, last_scanned, added_at)
-                    SELECT n.path, n.title, n.media_type, n.year, n.root, n.video_path,
-                           n.poster_path, n.poster2_path, n.mtime, ?, n.mtime
-                    FROM sync_new_items n
-                    WHERE NOT EXISTS (
-                        SELECT 1 FROM media m
-                        WHERE (n.video_path IS NOT NULL
-                               AND m.root = n.root
-                               AND LOWER(path_name(n.video_path)) = LOWER(path_name(m.video_path)))
-                           OR (m.root = n.root
-                               AND LOWER(n.title) = LOWER(m.title))
-                    )
-                """, (now,))
-
-                conn.execute("DROP TABLE sync_new_items")
+                # The matching happens in Python: one new item claims at
+                # most one old row, and only genuinely unmatched paths take
+                # part. Two same-titled items ("Dune (1984)", "Dune (2021)")
+                # can no longer take each other's place, and a generic
+                # "movie.mkv" can no longer drag a row onto the wrong path.
+                renamed_updates = []
+                refresh_updates = []
+                inserts = []
+                for i in items:
+                    key = canonical_path(i.path)
+                    old = renamed.get(i.path)
+                    if old is not None:
+                        title = old["title"] if old["from_provider"] else i.title
+                        year = i.year if i.year is not None else old["year"]
+                        renamed_updates.append((
+                            i.path, title, i.media_type, year, i.root,
+                            i.video_path if i.video_path is not None else old["video_path"],
+                            i.poster_path if i.poster_path is not None else old["poster_path"],
+                            i.poster2_path if i.poster2_path is not None else old["poster2_path"],
+                            i.mtime if i.mtime is not None else old["mtime"],
+                            now, i.mtime, old["id"],
+                        ))
+                    elif key in existing:
+                        row = existing[key]
+                        title = row["title"] if row["from_provider"] else i.title
+                        year = i.year if i.year is not None else row["year"]
+                        refresh_updates.append((
+                            title, i.media_type, year, i.root,
+                            i.video_path if i.video_path is not None else row["video_path"],
+                            i.poster_path if i.poster_path is not None else row["poster_path"],
+                            i.poster2_path if i.poster2_path is not None else row["poster2_path"],
+                            i.mtime if i.mtime is not None else row["mtime"],
+                            now, i.mtime, row["id"],
+                        ))
+                    else:
+                        inserts.append((
+                            i.path, i.title, i.media_type, i.year, i.root,
+                            i.video_path, i.poster_path, i.poster2_path,
+                            i.mtime, now, i.mtime,
+                        ))
+                if renamed_updates:
+                    conn.executemany(_UPDATE_RENAMED_MEDIA, renamed_updates)
+                if refresh_updates:
+                    conn.executemany(_UPDATE_REFRESH_MEDIA, refresh_updates)
+                if inserts:
+                    conn.executemany(_INSERT_NEW_MEDIA, inserts)
 
                 ids = {
                     canonical_path(row["path"]): row["id"]
@@ -1579,30 +1575,54 @@ class Database:
     def _match_renames(items: list, existing: dict) -> dict:
         """Match new items against the old rows they replace (a rename).
 
-        A renamed folder keeps its video file, so the file name is the
-        strongest signal; the title is the fallback for a series, which has
-        no single video file.
+        Only items whose path is new take part. A renamed folder keeps its
+        video file, so the file name is the strongest signal; the title is
+        the fallback, with the media type and the year to keep two
+        same-titled titles apart. Every old row is claimed at most once -
+        the first item in a stable order wins, the others are inserted as
+        new items instead of adopting a stranger's metadata.
         """
-        by_video: dict[tuple, dict] = {}
-        by_title: dict[tuple, dict] = {}
+        by_video: dict[tuple, list[dict]] = {}
+        by_title: dict[tuple, list[dict]] = {}
         for row in existing.values():
             video_path = row["video_path"]
             if video_path:
                 by_video.setdefault(
-                    (canonical_path(row["root"]), Path(video_path).name.lower()), row)
+                    (canonical_path(row["root"]), Path(video_path).name.lower()),
+                    [],
+                ).append(row)
             by_title.setdefault(
-                (canonical_path(row["root"]), str(row["title"] or "").strip().lower()), row)
+                (canonical_path(row["root"]), str(row["title"] or "").strip().lower()),
+                [],
+            ).append(row)
+        used: set[int] = set()
         out: dict = {}
-        for i in items:
+        for i in sorted(items, key=lambda item: item.path):
             if canonical_path(i.path) in existing:
                 continue
             row = None
             if i.video_path:
-                row = by_video.get((canonical_path(i.root), Path(i.video_path).name.lower()))
+                candidates = [
+                    r for r in by_video.get(
+                        (canonical_path(i.root), Path(i.video_path).name.lower()), [])
+                    if r["id"] not in used
+                ]
+                if len(candidates) == 1:
+                    row = candidates[0]
             if row is None:
-                row = by_title.get(
-                    (canonical_path(i.root), str(i.title or "").strip().lower()))
+                candidates = [
+                    r for r in by_title.get(
+                        (canonical_path(i.root), str(i.title or "").strip().lower()), [])
+                    if r["id"] not in used and r["media_type"] == i.media_type
+                ]
+                if len(candidates) > 1 and i.year is not None:
+                    same_year = [r for r in candidates if r["year"] == i.year]
+                    if same_year:
+                        candidates = same_year
+                if len(candidates) == 1:
+                    row = candidates[0]
             if row is not None:
+                used.add(row["id"])
                 out[i.path] = row
         return out
 
@@ -1678,7 +1698,9 @@ class Database:
     def save_metadata(self, media_id: int, data: dict) -> None:
         def enc(value) -> object:
             if isinstance(value, (list, tuple)):
-                return json.dumps(list(value), ensure_ascii=False)
+                # an empty list is "nothing was fetched", not data - COALESCE
+                # must keep the fields the item already has
+                return json.dumps(list(value), ensure_ascii=False) if value else None
             return value
 
         title = data.get("title")

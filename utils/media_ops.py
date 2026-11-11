@@ -25,6 +25,48 @@ def media_folder(item: dict) -> Path | None:
     return p
 
 
+def media_file(item: dict) -> Path | None:
+    """The video file of a loose movie item - None for a folder item."""
+    raw = item.get("video_path") or item.get("path")
+    if not raw:
+        return None
+    p = Path(raw)
+    try:
+        if p.is_file() and p.suffix:
+            return p
+    except OSError:
+        return None
+    return None
+
+
+def shares_folder_with_videos(video: Path) -> bool:
+    """Is there another video file in the same folder as this one?"""
+    try:
+        for entry in os.scandir(video.parent):
+            if not entry.is_file():
+                continue
+            if entry.name.lower() == video.name.lower():
+                continue
+            if Path(entry.name).suffix.lower() in config.VIDEO_EXTS:
+                return True
+    except OSError:
+        return False
+    return False
+
+
+def artwork_prefix(item: dict) -> str:
+    """The artwork file-name prefix of a media item.
+
+    A bare video that shares its folder with other videos must not write
+    poster.jpg / about.txt for the whole folder: its artwork is named
+    after the file ("Casablanca-poster.jpg", "Casablanca-about.txt").
+    """
+    video = media_file(item)
+    if video is not None and shares_folder_with_videos(video):
+        return f"{video.stem}-"
+    return ""
+
+
 def reveal(path) -> None:
     """Open a file or folder with the operating system's default handler."""
     if not path:
@@ -63,7 +105,9 @@ def play(path) -> None:
 
 def about_file(item: dict) -> Path | None:
     folder = media_folder(item)
-    return folder / "about.txt" if folder else None
+    if folder is None:
+        return None
+    return folder / f"{artwork_prefix(item)}about.txt"
 
 
 def remove_about(item: dict) -> None:

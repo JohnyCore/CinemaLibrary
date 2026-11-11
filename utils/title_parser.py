@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import datetime
 import re
 
 _PAREN_YEAR_RE = re.compile(r"[\(\[](19\d{2}|20\d{2})[\)\]]")
 _YEAR_RE = re.compile(r"(?<!\d)(19\d{2}|20\d{2})(?!\d)")
+
+# a bare year in a name counts as the release year only up to next year:
+# "Blade Runner 2049" is part of the title, not a year
+_RELEASE_YEAR_MAX = datetime.date.today().year + 1
 
 # Release / quality tags that may follow the year in a release folder name.
 _TAG_WORDS = (
@@ -100,7 +105,8 @@ def parse_title_and_year(text: str) -> tuple[str, int | None]:
 
     Handles "Inception (2010)", "The.Matrix.1999.BluRay" and
     "Some.Movie.2020.PROPER.1080p.WEB-DL.x264" alike. A year that only
-    starts the name ("2001: A Space Odyssey") is left alone.
+    starts the name ("2001: A Space Odyssey") is left alone, and so is a
+    future year in the title ("Blade Runner 2049").
     """
     t = text.strip()
     year = None
@@ -110,7 +116,7 @@ def parse_title_and_year(text: str) -> tuple[str, int | None]:
         t = t[: m.start()] + " " + t[m.end():]
     else:
         m = _TRAILING_YEAR_RE.search(t)
-        if m:
+        if m and int(m.group(1)) <= _RELEASE_YEAR_MAX:
             year = int(m.group(1))
             t = t[: m.start()]
     return tidy_title(t), year
@@ -126,7 +132,9 @@ def clean_for_search(title: str, year: int | None = None) -> str:
     m = _YEAR_RE.search(t)
     if m and (year is None or int(m.group(1)) == year):
         t = t[: m.start()]
-    t = re.sub(r"\s-\s?[^-]{1,40}$", " ", t)
+    # a dash suffix is only a release group when it is one token without
+    # spaces ("Movie - RARBG"); a real subtitle keeps its words
+    t = re.sub(r"\s-\s?\S{1,40}$", " ", t)
     return tidy_title(t) or original
 
 
@@ -177,7 +185,12 @@ def episode_numbers_all(name: str, inherited_season: int | None
         else:
             m = _LEAD_NUM_RE.match(stem)
             if m:
-                ep = int(m.group(1))
+                number = m.group(1)
+                # a zero-padded number is always an episode number; a plain
+                # three-digit one only when the name has no year of its own -
+                # "300 (2006).mkv" is the movie 300, not episode 300
+                if number.startswith("0") or parse_title_and_year(stem)[1] is None:
+                    ep = int(number)
     if ep is not None:
         return [(inherited_season, ep)]
     return []

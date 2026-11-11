@@ -32,7 +32,7 @@ _UA = "CinemaLibrary/1.0 (personal film library; local desktop app)"
 
 _MAX_TITLES = 50  # the API takes 50 titles per request
 _SLICE = 25       # items per request, so the progress moves every few seconds
-_QUOTE_BATCH = 20  # films per request when the quotes are looked up
+_QUOTE_BATCH = 6  # films per request when the quotes are looked up
 _TIMEOUT = 30
 _GAP = 3.0        # seconds between two api.php calls - Wikipedia throttles bursts
 _QUOTE_GAP = 1.2  # wikiquote is a different wiki and tolerates more
@@ -214,24 +214,37 @@ def _pick(pages: list[dict], title: str, year: int | None) -> dict | None:
 
 
 def _fetch_pages(titles: list[str], progress=None) -> dict[str, dict]:
-    """The categories and the Wikidata id of every title, in batches."""
+    """The categories and the Wikidata id of every title, in batches.
+
+    A single request caps the categories at 500 (cllimit=max) - a batch of
+    films asks for more than that, so the `continue` token is followed
+    until every category of every title has arrived.
+    """
     pages: dict[str, dict] = {}
+    done = 0
     for start in range(0, len(titles), _MAX_TITLES):
         chunk = titles[start:start + _MAX_TITLES]
-        data = _api({
+        params = {
             "action": "query", "prop": "categories|pageprops",
             "titles": "|".join(chunk), "cllimit": "max", "redirects": "1",
             "format": "json",
-        })
-        query = data.get("query", {})
-        mapping = {c: c for c in chunk}
-        for entry in query.get("normalized", []):
-            mapping[entry["from"]] = entry["to"]
-        for entry in query.get("redirects", []):
-            mapping[entry["from"]] = entry["to"]
-        pages.update(_resolve(query.get("pages", {}), mapping))
-        if progress:
-            progress(min(start + _MAX_TITLES, len(titles)), len(titles))
+        }
+        while True:
+            data = _api(params)
+            query = data.get("query", {})
+            mapping = {c: c for c in chunk}
+            for entry in query.get("normalized", []):
+                mapping[entry["from"]] = entry["to"]
+            for entry in query.get("redirects", []):
+                mapping[entry["from"]] = entry["to"]
+            pages.update(_resolve(query.get("pages", {}), mapping))
+            done = min(done + _MAX_TITLES, len(titles))
+            if progress:
+                progress(done, len(titles))
+            token = (data.get("continue") or {}).get("clcontinue")
+            if not token:
+                break
+            params["clcontinue"] = token
     return pages
 
 
@@ -651,27 +664,30 @@ def person_profile(name: str, role: str) -> dict[str, str | None] | None:
         "action": "query",
         "list": "search",
         "srsearch": f'"{name}" {role_term}'.strip(),
-        "srlimit": 1,
+        "srlimit": 5,
         "format": "json",
         "utf8": 1,
     })
-    results = data.get("query", {}).get("search", [])
-    if not results:
-        return None
-    title = results[0].get("title")
-    if not title:
-        return None
-    page = _get(_SUMMARY + urllib.parse.quote(title.replace(" ", "_")), gap=0.0)
-    extract = page.get("extract")
-    if not extract:
-        return None
-    return {
-        "title": page.get("title") or title,
-        "extract": extract,
-        "thumbnail": (page.get("thumbnail") or {}).get("source"),
-        "url": (page.get("content_urls") or {}).get("desktop", {}).get("page")
-                or article_url(title),
-    }
+    results = data.get("query", {}).get("search", []) or []
+    for result in results:
+        title = result.get("title")
+        if not title or _IS_WORK.search(str(title)):
+            # the first hit of a common name can be a film or a series
+            # rather than the person the library asked about
+            continue
+        page = _get(_SUMMARY + urllib.parse.quote(
+            str(title).replace(" ", "_")), gap=0.0)
+        extract = page.get("extract")
+        if not extract:
+            return None
+        return {
+            "title": page.get("title") or title,
+            "extract": extract,
+            "thumbnail": (page.get("thumbnail") or {}).get("source"),
+            "url": (page.get("content_urls") or {}).get("desktop", {}).get("page")
+                    or article_url(title),
+        }
+    return None
 
 
 def article_url(title: str) -> str | None:

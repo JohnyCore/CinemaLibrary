@@ -19,9 +19,10 @@ from database.db_manager import Database
 from metadata import metadata_service
 from metadata import true_story
 from metadata.person_profiles import fetch_person_profile, person_key
+from scanner import scan_state
 from utils import media_ops
 from utils.image_cache import BACKDROP_SIZES, ImageCache
-from utils.image_utils import find_artwork
+from utils.image_utils import find_item_artwork
 from ui.dialogs import (ConfirmDialog, DuplicateResolver, ImdbIdDialog,
                         PlayerDialog, PopupMenu)
 from ui.ep_renamer_view import EpRenamerView
@@ -69,115 +70,7 @@ def _result_summary(labels: list[str]) -> str:
 
 
 
-class VirtualizedTreeMixin:
-    """Mixin to add virtualized rendering to ttk.Treeview.
-    
-    Only renders visible items + buffer. Data stays in memory.
-    """
-    _virt_items: list = []          # All data items
-    _virt_visible_range: tuple = (0, 0)  # (first_idx, last_idx) currently rendered
-    _virt_buffer: int = 10          # Extra items to render above/below viewport
-    _virt_row_height: int = 26      # Approximate row height
-    _virt_last_update: float = 0    # Throttle updates
-    
-    def _virt_init(self, tree: ttk.Treeview, buffer: int = 10, row_height: int = 26):
-        """Initialize virtualization for a treeview."""
-        self._virt_tree = tree
-        self._virt_buffer = buffer
-        self._virt_row_height = row_height
-        self._virt_items = []
-        self._virt_visible_range = (0, 0)
-        
-        # Bind scroll events
-        tree.configure(yscrollcommand=self._virt_on_scroll)
-        tree.bind("<<TreeviewSelect>>", self._virt_on_select, add="+")
-        tree.bind("<Configure>", self._virt_on_configure, add="+")
-        
-    def _virt_set_items(self, items: list):
-        """Set the full item list and refresh visible range."""
-        self._virt_items = items
-        self._virt_refresh_visible()
-        
-    def _virt_on_scroll(self, *args):
-        """Handle scrollbar movement - throttle and refresh."""
-        self._virt_tree.yview(*args)
-        import time
-        now = time.time()
-        if now - self._virt_last_update > 0.05:  # 20fps max
-            self._virt_last_update = now
-            self._virt_refresh_visible()
-            
-    def _virt_on_configure(self, event):
-        """Handle tree resize."""
-        self._virt_refresh_visible()
-        
-    def _virt_on_select(self, event):
-        """Handle selection - ensure selected item is rendered."""
-        # Could expand to render selection if needed
-        pass
-        
-    def _virt_refresh_visible(self):
-        """Calculate and render only visible items."""
-        tree = self._virt_tree
-        if not tree.winfo_exists():
-            return
-            
-        # Get visible range from scrollbar
-        try:
-            yview = tree.yview()
-            if not yview or len(yview) != 2:
-                return
-            first_frac, last_frac = yview
-        except Exception:
-            return
-            
-        # Calculate visible item indices
-        total = len(self._virt_items)
-        if total == 0:
-            return
-            
-        # Estimate visible range
-        first_idx = int(first_frac * total)
-        last_idx = int(last_frac * total)
-        
-        # Add buffer
-        first_idx = max(0, first_idx - self._virt_buffer)
-        last_idx = min(total - 1, last_idx + self._virt_buffer)
-        
-        # Check if range changed significantly
-        old_first, old_last = self._virt_visible_range
-        if (abs(first_idx - old_first) < self._virt_buffer and 
-            abs(last_idx - old_last) < self._virt_buffer):
-            return
-            
-        self._virt_visible_range = (first_idx, last_idx)
-        
-        # Delete non-visible items, insert new visible ones
-        existing = set(tree.get_children())
-        needed = set(str(i) for i in range(first_idx, last_idx + 1))
-        
-        # Remove items no longer needed
-        for iid in existing - needed:
-            try:
-                tree.delete(iid)
-            except Exception:
-                pass
-                
-        # Insert missing items
-        for idx in range(first_idx, last_idx + 1):
-            iid = str(idx)
-            if iid not in existing:
-                self._virt_insert_item(idx)
-                
-    def _virt_insert_item(self, idx: int):
-        """Insert a single item at index - override in subclass."""
-        raise NotImplementedError
-        
-    def _virt_get_item_data(self, idx: int):
-        """Get item data for index - override in subclass."""
-        return self._virt_items[idx] if 0 <= idx < len(self._virt_items) else None
-
-class SettingsView(VirtualizedTreeMixin, tk.Frame):
+class SettingsView(tk.Frame):
     """Full-page settings, shown inside the main content area."""
 
     def __init__(self, master, on_saved, db: Database, images: ImageCache,
@@ -207,7 +100,6 @@ class SettingsView(VirtualizedTreeMixin, tk.Frame):
         self._people_running = False
         self._people_cancel = threading.Event()
         self._drag_select_anchor: str | None = None
-        self._bulk_pool = ThreadPoolExecutor(max_workers=FETCH_WORKERS)
 
         header = tk.Frame(self, bg=BG)
         header.pack(fill="x")
@@ -810,7 +702,9 @@ class SettingsView(VirtualizedTreeMixin, tk.Frame):
                         "runtime": row.get("runtime", ""),
                         "rating": row.get("rating", ""),
                         "my_rating": row.get("my_rating", ""),
-                        "watched": row.get("watched", 0),
+                        # a series is watched through its episodes, not
+                        # through media.watched, which is never set for one
+                        "watched": 1 if row.get("seen") else 0,
                         "genres": row.get("genres") or "",
                         "director": row.get("director") or "",
                         "writer": row.get("writer") or "",
@@ -1215,16 +1109,14 @@ class SettingsView(VirtualizedTreeMixin, tk.Frame):
             self._fetch_all_btn.configure(state="normal")
             self._bulk_status.configure(text=f"Found {len(self._bulk_items)} items without metadata.")
 
-            # Initialize virtualization
-            self._virt_init(self._bulk_tree, buffer=15, row_height=26)
-            self._virt_set_items(self._bulk_items)
+            for index in range(len(self._bulk_items)):
+                self._insert_bulk_row(index)
 
-
-    def _virt_insert_item(self, idx: int):
-        """Insert a single bulk item at index."""
-        if idx >= len(self._bulk_items):
+    def _insert_bulk_row(self, index: int):
+        """Insert one bulk item row into the tree."""
+        if index >= len(self._bulk_items):
             return
-        item = self._bulk_items[idx]
+        item = self._bulk_items[index]
         media_id = item["id"]
         title = item.get("title") or "Unknown"
         year = f" ({item['year']})" if item.get("year") else ""
@@ -1233,7 +1125,7 @@ class SettingsView(VirtualizedTreeMixin, tk.Frame):
         missing_text = "Missing: " + ", ".join(missing) if missing else ""
         self._bulk_tree.insert("", "end", iid=str(media_id),
                            values=(f"{title}{year}", mtype, missing_text, ""),
-                           tags=("odd",) if idx % 2 else ())
+                           tags=("odd",) if index % 2 else ())
 
     def _on_bulk_double_click(self, event) -> None:
         """Handle double-click: fetch the item, or offer an IMDb ID on errors."""
@@ -1378,7 +1270,7 @@ class SettingsView(VirtualizedTreeMixin, tk.Frame):
                     p = Path(item.get("video_path") or item.get("path") or "")
                     folder = p.parent if p.is_file() else p
                     if folder.exists():
-                        poster, backdrop = find_artwork(folder)
+                        poster, backdrop = find_item_artwork(p)
                         if poster or backdrop:
                             self._db.set_artwork_paths(
                                 media_id,
@@ -1395,7 +1287,11 @@ class SettingsView(VirtualizedTreeMixin, tk.Frame):
             failed = 0
             # The pool is fed by hand: `map` would queue every item up
                     # front, and "Stop" would only end the reporting.
-            pool = self._bulk_pool
+            # A pool is created for every run: a shut-down pool cannot take
+            # new work, and a second run ("Retry failed", "Fetch Selected",
+            # a double-click) must not die on it.
+            pool = ThreadPoolExecutor(max_workers=FETCH_WORKERS,
+                                      thread_name_prefix="bulk-fetch")
             try:
                 pending: set = set()
                 source = iter(items)
@@ -2117,7 +2013,7 @@ class SettingsView(VirtualizedTreeMixin, tk.Frame):
         if not todo:
             nf = len([i for i in items if not self._db.story_cache(i["id"])])
             self._deeper_status.configure(
-                text=(f"Every story is cached - it can be read without a network."
+                text=("Every story is cached - it can be read without a network."
                       if not nf else
                       f"Nothing left to cache - {nf} title(s) have no article "
                       f"about their story, so there is nothing to fetch."))
@@ -2787,6 +2683,9 @@ class SettingsView(VirtualizedTreeMixin, tk.Frame):
         except Exception as exc:
             self._health_status.configure(text=f"Could not relink: {exc}", fg=ACCENT)
             return
+        # the scan state no longer describes the library: without this the
+        # next rescan would say "up to date" and skip the relinked item
+        scan_state.invalidate()
         self._refresh_health()
         self._health_status.configure(
             text=f"“{item.get('title')}” now points at {new_path}")
@@ -2910,6 +2809,8 @@ class SettingsView(VirtualizedTreeMixin, tk.Frame):
 
     def _redetect_series_files(self, item: dict) -> None:
         """Scan the series folder again and fetch the files it holds now."""
+        from dataclasses import replace
+
         from scanner import library_scanner
         title = str(item.get("title") or "Unknown")
         before = self._db.missing_episodes_detail(item["id"])
@@ -2919,8 +2820,15 @@ class SettingsView(VirtualizedTreeMixin, tk.Frame):
                 text=f"Re-checked “{title}”: no video files on the disk.",
                 fg=ACCENT)
             return
-        identified = [e for e in scan.episodes if e.episode is not None]
-        stayed = [e for e in scan.episodes if e.episode is None]
+        # the normal scan puts the episodes of a series without season
+        # folders into season 1 - the re-check has to do the same, or the
+        # rows get a NULL season and every episode is saved twice
+        episodes = scan.episodes
+        if not scan.has_season_dir:
+            episodes = [replace(e, season=1) if e.season is None else e
+                        for e in episodes]
+        identified = [e for e in episodes if e.episode is not None]
+        stayed = [e for e in episodes if e.episode is None]
         self._db.save_scanned_episodes(item["id"], identified)
         if stayed:
             names = "\n".join(sorted({Path(e.path).name for e in stayed})[:15])

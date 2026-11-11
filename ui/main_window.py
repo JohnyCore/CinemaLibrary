@@ -27,7 +27,8 @@ from metadata import metadata_service
 from metadata.person_profiles import fetch_person_profile, person_key
 from scanner import scan_state
 from scanner.library_scanner import scan
-from events import event_bus, ItemFetched, ScanFinished, MetadataChanged, ItemWatched, ItemRating
+from events import (FilterRequested, ItemFetched, ItemRating, ItemWatched,
+                    MetadataChanged, ScanFinished, event_bus)
 from ui.details_view import DetailsView
 from ui.dialogs import ConfirmDialog, PopupMenu, PromptDialog
 from ui.folder_dialog import FolderDialog
@@ -232,6 +233,7 @@ class MainWindow(tk.Frame):
                                   config.PLACEHOLDER_PATH)
         self._scan_running = False
         self._rescan_requested = False
+        self._rescan_nudge = False
         self._closing = False
         self._search_job: str | None = None
         self._search_text = ""
@@ -264,6 +266,7 @@ class MainWindow(tk.Frame):
         event_bus.subscribe(MetadataChanged, lambda e: self._on_items_fetched(e.media_ids))
         event_bus.subscribe(ItemWatched, lambda e: self._on_item_watched(e.media_id, e.watched))
         event_bus.subscribe(ItemRating, lambda e: self._on_item_rating(e.media_id, e.rating))
+        event_bus.subscribe(FilterRequested, lambda e: self._on_filter_requested(e.kind, e.value))
 
         # a posted callback wakes the main thread at once; the slow poll is
         # only there in case a wake-up event was lost
@@ -442,6 +445,7 @@ class MainWindow(tk.Frame):
         )
         self._insights = tk.Frame(body, bg=BG)
         self._settings = SettingsView(body, self._on_settings_saved, self._db, self._images,
+                                          on_changed=self._on_items_fetched,
                                           post=self._post,
                                           on_rescan=self._rescan_clicked,
                                           on_open_item=self._open_item)
@@ -1032,15 +1036,24 @@ class MainWindow(tk.Frame):
         if self._collections:
             entries.append((f"Move {many} item(s) to folder…",
                             lambda: self._move_to_folder(chosen)))
-        if item.get("media_type") == "series":
-            entries.append(("Mark all episodes watched",
-                            lambda: self._mark_series_watched(chosen)))
-        else:
-            watched = all(bool(i.get("watched")) for i in chosen)
+        # the menu works on the whole selection: series and movies get
+        # their own entries, so a mixed selection acts on both
+        series_items = [i for i in chosen if i.get("media_type") == "series"]
+        movie_items = [i for i in chosen if i.get("media_type") != "series"]
+        if series_items:
+            count = len(series_items)
+            entries.append((
+                "Mark all episodes watched" if count == 1
+                else f"Mark {count} series watched",
+                lambda s=series_items: self._mark_series_watched(s),
+            ))
+        if movie_items:
+            watched = all(bool(i.get("watched")) for i in movie_items)
             label = "Mark as Unwatched" if watched else "Mark as Watched"
-            if many > 1:
-                label = f"Mark {many} items as {'Unwatched' if watched else 'Watched'}"
-            entries.append((label, lambda: self._set_watched(chosen, not watched)))
+            if len(movie_items) > 1:
+                label = (f"Mark {len(movie_items)} items as "
+                         f"{'Unwatched' if watched else 'Watched'}")
+            entries.append((label, lambda m=movie_items: self._set_watched(m, not watched)))
         if folder_id is not None:
             folder_items = [
                 media for media in chosen
@@ -1133,6 +1146,10 @@ class MainWindow(tk.Frame):
             return
         if any(name.lower() == c["name"].lower() for c in self._collections
                if c["id"] != collection["id"]):
+            # a clash is not a crash - the user has to learn why nothing
+            # happened
+            self._status_left.configure(
+                text=f"A folder called \"{name}\" already exists.")
             return
         self._db.rename_collection(collection["id"], name)
         self._load_from_db()
@@ -1161,6 +1178,26 @@ class MainWindow(tk.Frame):
 
     def _on_item_fetched(self, media_id: int) -> None:
         self._on_items_fetched([media_id])
+
+    def _on_item_watched(self, media_id: int, watched: bool) -> None:
+        self._on_items_fetched([media_id])
+
+    def _on_item_rating(self, media_id: int, rating) -> None:
+        self._on_items_fetched([media_id])
+
+    def _on_scan_finished(self, counts: dict) -> None:
+        """The grid follows a scan that finished somewhere else."""
+        self._load_from_db()
+        self._status_left.configure(
+            text=f"Scan finished — {counts.get('movie', 0)} movies, "
+                 f"{counts.get('series', 0)} series"
+        )
+
+    def _on_filter_requested(self, kind: str, value: str) -> None:
+        """A genre or country link in the details view filters the grid."""
+        self._show_library()
+        self._set_section("all")
+        self._set_chip(kind, value)
 
     def _on_items_fetched(self, media_ids: "list[int]") -> None:
         """Refresh one or many items in the library list.
@@ -1627,7 +1664,9 @@ class MainWindow(tk.Frame):
         self._series_dir = config.SERIES_DIR
         self._load_from_db()
         self._show_library()
-        self._rescan_clicked()
+        # a saved setting (or a restored backup) may have changed anything -
+        # the scan must not be skipped by a stale signature
+        self._rescan_clicked(force=True)
 
     def _show_library(self, event=None) -> None:
         self._details.hide()
@@ -1658,7 +1697,7 @@ class MainWindow(tk.Frame):
 
     # --- scanning -----------------------------------------------------
 
-    def _rescan_clicked(self) -> None:
+    def _rescan_clicked(self, force: bool = False) -> None:
         if self._closing:
             return
         if self._scan_running:
@@ -1666,6 +1705,9 @@ class MainWindow(tk.Frame):
             # new folder is never left unindexed
             self._rescan_requested = True
             return
+        # a skipped scan says so - a second click then forces a full scan
+        force = force or self._rescan_nudge
+        self._rescan_nudge = False
         self._scan_running = True
         self._rescan_btn.configure(state="disabled", text="Scanning…")
         self._status_left.configure(text="Scanning library…")
@@ -1691,11 +1733,13 @@ class MainWindow(tk.Frame):
             sig = scan_state.root_signature(root)
             if sig is not None:
                 current[key] = sig
-        if previous and current and all(current.get(scan_state.root_key(root)) == previous.get(scan_state.root_key(root)) for root in (movies_dir, series_dir) if root is not None):
+        if not force and previous and current and all(current.get(scan_state.root_key(root)) == previous.get(scan_state.root_key(root)) for root in (movies_dir, series_dir) if root is not None):
+            self._rescan_nudge = True
             self._scan_running = False
             self._rescan_btn.configure(state="normal", text="Rescan Library")
             self._scan_progress.pack_forget()
-            self._status_left.configure(text="Library up to date - no changes detected.")
+            self._status_left.configure(
+                text="Library up to date - click Rescan again to scan anyway.")
             return
 
         def worker() -> None:
@@ -1731,13 +1775,11 @@ class MainWindow(tk.Frame):
                 self._scan_running = False
                 self._rescan_btn.configure(state="normal", text="Rescan Library")
                 self._scan_progress.pack_forget()
-                next_state = scan_state.load_scan_state()
-                for root in (movies_dir, series_dir):
-                    if root is None:
-                        continue
-                    sig = scan_state.root_signature(root)
-                    if sig is not None:
-                        next_state[scan_state.root_key(root)] = sig
+                # the signature that is saved is the one taken BEFORE the
+                # scan walked: a change made while the scan was running is
+                # not in the snapshot, so the next rescan picks it up
+                next_state = dict(previous)
+                next_state.update(current)
                 scan_state.save_scan_state(next_state)
                 self._status_left.configure(
                     text=f"Scan finished in {seconds:.1f}s — "

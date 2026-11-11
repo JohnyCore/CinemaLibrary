@@ -272,15 +272,24 @@ class CinemetaService(MetadataService):
         self, title: str, year: int | None = None, media_type: str | None = None,
         imdb_id: str | None = None,
     ) -> MetadataResult | None:
-        if imdb_id and media_type:
-            # the id is known already - skip the catalog search entirely
-            t = _TYPE_MAP.get(media_type, "movie")
-            try:
-                data = _get_json(f"{_BASE}/meta/{t}/{imdb_id}.json")["meta"]
-            except Exception as exc:
-                log.warning("cinemeta meta fetch failed for %s: %s", imdb_id, exc)
-            else:
+        if imdb_id:
+            # the id is known already - skip the catalog search entirely.
+            # A silent fallback to a title search could return a different
+            # title, so both types are tried and a miss fails loudly.
+            wanted = _TYPE_MAP.get(media_type or "", "movie")
+            types = [wanted, "series" if wanted == "movie" else "movie"]
+            last: Exception | None = None
+            for t in types:
+                try:
+                    data = _get_json(f"{_BASE}/meta/{t}/{imdb_id}.json")["meta"]
+                except Exception as exc:
+                    log.warning("cinemeta meta fetch failed for %s (%s): %s",
+                                imdb_id, t, exc)
+                    last = exc
+                    continue
                 return _to_result(data, t)
+            raise MetadataError(
+                f"no metadata for IMDb id {imdb_id}: {last}")
         query = self.clean_query(title, year)
         if media_type:
             types = [_TYPE_MAP.get(media_type, "movie")]

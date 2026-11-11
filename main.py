@@ -16,15 +16,26 @@ from utils import image_utils
 def main() -> None:
     config.init()
     image_utils.ensure_placeholder(config.PLACEHOLDER_PATH)
-    handler = logging.handlers.RotatingFileHandler(
-        config.LOG_DIR / "app.log", maxBytes=1_000_000, backupCount=2,
-        encoding="utf-8",
-    )
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-        handlers=[handler, logging.StreamHandler()],
-    )
+    try:
+        handler = logging.handlers.RotatingFileHandler(
+            config.LOG_DIR / "app.log", maxBytes=1_000_000, backupCount=2,
+            encoding="utf-8",
+        )
+    except OSError:
+        # a log directory that cannot be created must not stop the app
+        handler = None
+    if handler is not None:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+            handlers=[handler, logging.StreamHandler()],
+        )
+    else:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+            handlers=[logging.StreamHandler()],
+        )
     log = logging.getLogger("cinema")
     started = time.perf_counter()
 

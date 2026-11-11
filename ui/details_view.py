@@ -13,14 +13,15 @@ from typing import Callable
 from PIL import Image, ImageTk
 
 from database.db_manager import Database
+from events import FilterRequested, ItemFetched, event_bus
 from metadata import metadata_service
 from utils import media_ops
 from utils.image_cache import ImageCache, ImageJob
-from utils.image_utils import find_artwork
+from utils.image_utils import find_item_artwork
 from ui.window_utils import ScrollArea, setup_popup
 from ui.icons import font as icon_font, glyph as icon_glyph, photo as icon_photo
 from ui.dialogs import ImdbIdDialog
-from utils.image_cache import BACKDROP_SIZES, bucket_size
+from utils.image_cache import bucket_size
 
 log = logging.getLogger(__name__)
 
@@ -85,6 +86,7 @@ class DetailsView(tk.Frame):
         self._panel_signature: tuple | None = None
         # Bucket cache for tinted backdrops: bucket_size -> PhotoImage
         self._backdrop_buckets: dict[tuple[int, int], ImageTk.PhotoImage] = {}
+        self._backdrop_source: str | None = None
 
         self.canvas = tk.Canvas(self, bg=BG, highlightthickness=0)
         self.canvas.pack(fill="both", expand=True)
@@ -647,7 +649,6 @@ class DetailsView(tk.Frame):
             log.exception("could not open browser for %s", imdb_id)
 
     def _dispatch_filter(self, kind: str, value: str) -> None:
-        from events import event_bus, FilterRequested
         event_bus.emit(FilterRequested(kind=kind, value=value))
     @staticmethod
     def _split_names(value) -> list[str]:
@@ -861,7 +862,7 @@ class DetailsView(tk.Frame):
         p = Path(media_path)
         folder = p.parent if p.is_file() else p
         if folder.exists():
-            poster, backdrop = find_artwork(folder)
+            poster, backdrop = find_item_artwork(p)
             if poster or backdrop:
                 self._db.set_artwork_paths(
                     media_id,
@@ -1057,7 +1058,6 @@ class DetailsView(tk.Frame):
         self._fetch_selected(candidate, media_id, generation, overwrite_artwork)
 
     def _notify_fetched(self, media_id: int) -> None:
-            from events import event_bus, ItemFetched
             event_bus.emit(ItemFetched(media_id=media_id))
 
     def _refresh_from_db(self, media_id: int) -> None:
@@ -1102,7 +1102,10 @@ class DetailsView(tk.Frame):
             return
 
         self._ep_groups = groups
-        self._ep_by_path = {e["path"]: e for e in episodes}
+        by_path: dict[str, list[dict]] = {}
+        for episode in episodes:
+            by_path.setdefault(episode["path"], []).append(episode)
+        self._ep_by_path = by_path
         self._ep_rows: dict[str, dict] = {}
         self._ep_seasons: dict[str, dict] = {}
 
@@ -1203,10 +1206,10 @@ class DetailsView(tk.Frame):
     def _update_episode_row(self, path: str) -> None:
         """The watched mark of one episode."""
         widgets = self._ep_rows.get(path)
-        episode = self._ep_by_path.get(path)
-        if widgets is None or episode is None:
+        episodes = self._ep_by_path.get(path)
+        if widgets is None or not episodes:
             return
-        watched = bool(episode.get("watched"))
+        watched = bool(episodes[0].get("watched"))
         for button in widgets["watched"]:
             button.configure(
                 text=icon_glyph("check" if watched else "circle"),
@@ -1249,13 +1252,18 @@ class DetailsView(tk.Frame):
         # the list is shorter or longer now - the flow region follows
         self._upper.update_scrollregion()
     def _toggle_episode(self, path: str) -> None:
-        """Mark one episode as watched or unwatched."""
-        episode = self._ep_by_path.get(path)
-        if episode is None:
+        """Mark one episode as watched or unwatched.
+
+        A chained file holds several episodes that share one path, so the
+        flag is read and written for every episode of that file.
+        """
+        episodes = self._ep_by_path.get(path)
+        if not episodes:
             return
-        new_state = not bool(episode.get("watched"))
+        new_state = not bool(episodes[0].get("watched"))
         self._db.set_episodes_watched([path], new_state)
-        episode["watched"] = 1 if new_state else 0
+        for episode in episodes:
+            episode["watched"] = 1 if new_state else 0
         self._update_episode_row(path)
         for name, eps in self._ep_groups:
             if any(e["path"] == path for e in eps):
@@ -1287,6 +1295,11 @@ class DetailsView(tk.Frame):
             self._last_bucket = (bucket_w, bucket_h)
             item = self._item or {}
             source = item.get("poster2_path") or item.get("poster_path")
+            # the tinted panel backgrounds are cached per source: without
+            # this, the next title would show the previous one's backdrop
+            if source != self._backdrop_source:
+                self._backdrop_buckets.clear()
+                self._backdrop_source = source
             self._bg_job = self._images.get_backdrop(
                 source, (bucket_w, bucket_h), self._apply_bg, priority=0,
             )

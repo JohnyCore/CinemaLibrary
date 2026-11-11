@@ -274,6 +274,10 @@ def _richness(item: dict) -> tuple:
     return (known, 1 if item.get("poster_path") else 0, len(item.get("path") or ""))
 
 
+_RADIO_ON = "●  "
+_RADIO_OFF = "○  "
+
+
 class DuplicateResolver(tk.Toplevel):
     """Choose which copy of a duplicate title stays in the library.
 
@@ -309,11 +313,13 @@ class DuplicateResolver(tk.Toplevel):
                 text = f"{item.get('path')}   ({known[0]} fields)"
                 # a plain label, not a radio button: the native one cannot
                 # be seen in a dark window
-                label = tk.Label(inner, text="â—‹  " + text, bg=PANEL_BG, fg=MUTED,
-                                 font=("Segoe UI", 9), anchor="w", cursor="hand2")
+                label = tk.Label(
+                    inner, text=_RADIO_OFF + text, bg=PANEL_BG, fg=MUTED,
+                    font=("Segoe UI", 9), anchor="w", cursor="hand2")
                 label.pack(anchor="w", fill="x")
                 label.bind("<Button-1>",
                            lambda _e, g=group, p=item["path"]: self._choose(g, p))
+                label._plain_text = text
                 buttons.append((item["path"], label))
             self._buttons[key] = buttons
             self._keep[key] = self._best(group)["path"]
@@ -345,8 +351,10 @@ class DuplicateResolver(tk.Toplevel):
         self._keep[key] = path
         for other, label in self._buttons.get(key, []):
             chosen = other == path
-            label.configure(text=("â—  " if chosen else "â—‹  ") + label.cget("text")[2:],
-                            fg=TEXT if chosen else MUTED)
+            label.configure(
+                text=(_RADIO_ON if chosen else _RADIO_OFF)
+                + label._plain_text,
+                fg=TEXT if chosen else MUTED)
 
     def _keep_best(self) -> None:
         for group in self.groups:

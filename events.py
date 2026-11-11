@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Callable, Generic, TypeVar
+from typing import Callable, TypeVar
 
 log = logging.getLogger(__name__)
 
@@ -71,7 +71,9 @@ class EventBus:
     def emit(self, event: T) -> None:
         """Emit an event to all subscribers."""
         event_type = type(event)
-        for handler in self._subscribers.get(event_type, []):
+        # iterate a copy: a handler may subscribe or unsubscribe while it
+        # runs and must never skip or keep handlers by accident
+        for handler in list(self._subscribers.get(event_type, [])):
             try:
                 handler(event)
             except Exception:
