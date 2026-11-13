@@ -432,10 +432,23 @@ outside: how many items, movies and series it holds, how many hours of
 runtime are known, how many of them you rated and how much video is on
 disk. The list on the left names the problems — duplicate titles, items
 without metadata, items without a poster, movies you never watched, titles
-that were never checked for a true story, and files that are not on the
-disk any more (an unplugged drive, a moved folder) — and the list on the
-right shows the items behind the selected problem. **Open Details Page**
-jumps to one of them.
+that were never checked for a true story, missing episodes, and files that
+are not on the disk any more (an unplugged drive, a moved folder) — and the
+list on the right shows the items behind the selected problem. **Open
+Details Page** jumps to one of them.
+
+The **Missing subtitle** problem lists every movie and every episode of a
+series whose video carries no subtitles at all. For each video its folder
+is searched for a sidecar file that belongs to it (.srt, .ass, .ssa, .vtt,
+.ttml, .dfxp, .smi/.sami, .sub/.idx, .sup, .scc, .stl, .cap, .lrc), and
+when none is found the video file itself is read for embedded subtitle
+tracks (Matroska and MP4 containers are read directly and decide instantly;
+with ffprobe installed the other containers can be checked as well). A row
+says `S01E02: no external or embedded subtitles`, or `… embedded could not
+be checked` when the container format is not readable without ffprobe.
+Files that are gone from the disk are not reported here — they are already
+under *Missing from disk*. The count shows `…` while the check runs in the
+background and fills in when it finishes.
 
 * **Resolve duplicates** (on the duplicate problem) asks which copy of every
   title stays — the richest one is offered first. The copies that are

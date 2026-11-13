@@ -1396,6 +1396,93 @@ class Database:
         row = self.conn.execute(f"SELECT COUNT(*) AS n FROM media {where}").fetchone()
         return int(row["n"])
 
+    def subtitle_report(self) -> list[dict]:
+        """The videos with no subtitles - sidecar or embedded.
+
+        One row per video: a movie by its file, a series by its episode
+        files (chained episodes in one file are one check). Files that
+        are gone from the disk are skipped - the "Missing from disk"
+        report covers those.
+        """
+        from utils.subtitle_check import video_subtitle_state
+
+        cache: dict[str, bool | None] = {}
+        report: list[dict] = []
+        rows = self.conn.execute(_SELECT_MEDIA).fetchall()
+        episodes: dict[int, list[dict]] = {}
+        seen: dict[int, set[str]] = {}
+        for r in self.conn.execute(
+            "SELECT series_id, season, episode, path, name FROM episodes "
+            "ORDER BY series_id, season, episode"
+        ):
+            group = episodes.setdefault(r["series_id"], [])
+            paths = seen.setdefault(r["series_id"], set())
+            if r["path"] in paths:
+                continue
+            paths.add(r["path"])
+            group.append(dict(r))
+        for row in rows:
+            item = dict(row)
+            if item.get("media_type") == "series":
+                entries = episodes.get(item["id"], [])
+                if not entries:
+                    entries = [
+                        {"season": None, "episode": None, "path": p,
+                         "name": Path(p).stem}
+                        for p in self._series_folder_videos(item.get("path"))
+                    ]
+            else:
+                target = item.get("video_path") or item.get("path")
+                entries = [{"season": None, "episode": None, "path": target,
+                            "name": None}] if target else []
+            for entry in entries:
+                path = entry["path"]
+                if not path or not Path(path).is_file():
+                    continue
+                missing, note = video_subtitle_state(path, cache)
+                if not missing:
+                    continue
+                if item.get("media_type") == "series":
+                    label = self._episode_label(entry)
+                    detail = f"{label}: {note}" if label else note
+                else:
+                    detail = note
+                report.append({
+                    "id": item["id"],
+                    "title": item.get("title") or "Unknown",
+                    "year": item.get("year"),
+                    "media_type": item.get("media_type"),
+                    "detail": detail,
+                })
+        return report
+
+    @staticmethod
+    def _episode_label(entry: dict) -> str:
+        """Readable episode position: "S01E02", or the file's own name."""
+        season, episode = entry.get("season"), entry.get("episode")
+        if season is not None and episode is not None:
+            return f"S{season:02d}E{episode:02d}"
+        return (entry.get("name")
+                or Path(entry.get("path") or "").stem or "episode")
+
+    @staticmethod
+    def _series_folder_videos(folder_text: "str | None") -> list[str]:
+        """The video files of a series folder, when its rows are gone."""
+        from scanner.library_scanner import VIDEO_EXTS
+        folder = Path(folder_text or "")
+        try:
+            if not folder.is_dir():
+                return []
+        except OSError:
+            return []
+        paths = []
+        for base, _dirs, files in os.walk(folder):
+            for name in files:
+                if Path(name).suffix.lower() not in VIDEO_EXTS:
+                    continue
+                paths.append(os.path.join(base, name))
+        return sorted(paths)
+
     def sync(
             self,
             items: list,

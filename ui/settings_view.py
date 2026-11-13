@@ -2471,6 +2471,7 @@ class SettingsView(tk.Frame):
         ("gaps", "Missing episodes"),
         ("future", "Upcoming seasons"),
         ("missing", "Missing from disk"),
+        ("subtitle", "Missing subtitle"),
     )
 
     def _build_library_health(self, parent: tk.Frame) -> None:
@@ -2507,8 +2508,10 @@ class SettingsView(tk.Frame):
             state="disabled", **btn_style, disabledforeground="#5a6472")
         self._health_dupes_btn.pack(side="right", padx=(8, 0))
         self._health_missing: list[dict] = []
+        self._health_no_subs: list[dict] = []
         self._health_size: int | None = None
         self._health_measuring = False
+        self._health_subs_measuring = False
         self._health_item_ids: dict[str, int] = {}
 
         body = tk.Frame(inner, bg=PANEL_BG)
@@ -2725,6 +2728,24 @@ class SettingsView(tk.Frame):
         parts.append("measuring the size…")
         self._health_status.configure(text=" · ".join(parts))
 
+        if not self._health_subs_measuring:
+            self._health_subs_measuring = True
+            if self._health_issues.exists("subtitle"):
+                self._health_issues.item(
+                    "subtitle", values=("Missing subtitle", "…"))
+
+            def sub_worker() -> None:
+                try:
+                    rows = self._db.subtitle_report()
+                except Exception:
+                    log.exception("health subtitle report failed")
+                    self._post(self._health_subtitle_failed)
+                    return
+                self._post(lambda: self._health_subtitles(rows))
+
+            threading.Thread(
+                target=self._db.thread_target(sub_worker), daemon=True).start()
+
         if self._health_measuring:
             return
         self._health_measuring = True
@@ -2756,6 +2777,22 @@ class SettingsView(tk.Frame):
             self._health_issues.item(
                 "missing", values=("Missing from disk", len(missing)))
 
+    def _health_subtitle_failed(self) -> None:
+        self._health_subs_measuring = False
+        self._health_status.configure(text="The subtitle check could not run.")
+
+    def _health_subtitles(self, rows: list[dict]) -> None:
+        """The videos with no subtitles, sidecar or embedded."""
+        self._health_subs_measuring = False
+        self._health_no_subs = rows
+        if self._health_issues.exists("subtitle"):
+            self._health_issues.item(
+                "subtitle", values=("Missing subtitle", len(rows)))
+        # the list stays on the issue it shows: a finished scan fills it in
+        issue = self._health_issues.selection()
+        if issue and issue[0] == "subtitle":
+            self._on_health_issue()
+
     def _on_health_issue(self, event=None) -> None:
         """Show the items of the selected issue."""
         selection = self._health_issues.selection()
@@ -2769,8 +2806,12 @@ class SettingsView(tk.Frame):
         for iid in self._health_items.get_children():
             self._health_items.delete(iid)
         self._health_item_ids.clear()
-        items = (self._health_missing if issue == "missing"
-                 else self._db.health_items(issue))
+        if issue == "missing":
+            items = self._health_missing
+        elif issue == "subtitle":
+            items = self._health_no_subs
+        else:
+            items = self._db.health_items(issue)
         for index, item in enumerate(items):
             title = item.get("title") or "Unknown"
             if item.get("detail"):
@@ -2778,6 +2819,9 @@ class SettingsView(tk.Frame):
             year = item.get("year") or ""
             kind = "Series" if item.get("media_type") == "series" else "Movie"
             iid = f"media:{item['id']}"
+            if issue == "subtitle":
+                # a series can hold several subtitle-less episodes
+                iid += f":{index}"
             self._health_item_ids[iid] = item["id"]
             self._health_items.insert(
                 "", "end", iid=iid, values=(title, year, kind),

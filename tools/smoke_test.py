@@ -1118,6 +1118,143 @@ def organizer_checks(target: Path) -> None:
           renamed.target.name == "Show S01E01 - Real.mkv")
 
 
+def subtitle_checks() -> None:
+    """The Library Health "Missing subtitle" checks."""
+    from unittest.mock import patch
+
+    from database.db_manager import Database
+    from utils.subtitle_check import (_mkv_has_subtitle_track,
+                                      _mp4_has_subtitle_track,
+                                      sidecar_subtitles, stems_match,
+                                      video_subtitle_state)
+
+    def tiny_mkv(track_type: int) -> bytes:
+        def el(eid: bytes, payload: bytes) -> bytes:
+            return eid + bytes([0x80 | len(payload)]) + payload
+        entry = el(bytes([0xAE]), el(bytes([0x83]), bytes([track_type])))
+        tracks = el(bytes([0x16, 0x54, 0xAE, 0x6B]), entry)
+        segment = el(bytes([0x18, 0x53, 0x80, 0x67]), tracks)
+        header = el(bytes([0x1A, 0x45, 0xDF, 0xA3]), b"\x00" * 4)
+        return header + segment
+
+    def tiny_mp4(fmt: bytes) -> bytes:
+        def box(typ: bytes, payload: bytes) -> bytes:
+            return (8 + len(payload)).to_bytes(4, "big") + typ + payload
+        sample = box(fmt, b"\x00" * 8)
+        stsd = box(b"stsd", b"\x00" * 4 + (1).to_bytes(4, "big") + sample)
+        moov = box(b"moov", box(b"trak", box(b"mdia",
+                   box(b"minf", box(b"stbl", stsd)))))
+        return box(b"ftyp", b"isom") + moov
+
+    # name matching: release tags on the video, language tags on the subtitle
+    check("a release-tagged video matches its language sidecar",
+          stems_match("Movie 2020 1080p", "Movie 2020 en"))
+    check("a plain name matches a plain sidecar",
+          stems_match("Movie 2020", "Movie.2020.en"))
+    check("an episode matches its numbered sidecar",
+          stems_match("Series S01E02", "Series S01E02 English"))
+    check("another year is another video",
+          not stems_match("Movie 2020", "Movie 2021"))
+    check("another episode is another video",
+          not stems_match("Series S01E02", "Series S01E03"))
+    check("an unrelated name does not match",
+          not stems_match("Movie 2020", "Other Film"))
+
+    root = Path(tempfile.mkdtemp(prefix="cinema_subs_"))
+    try:
+        (root / "Subbed Movie 2020").mkdir()
+        (root / "Bare Movie 2020").mkdir()
+        (root / "Test Show").mkdir()
+        (root / "Subbed Movie 2020" / "Movie.2020.1080p.mkv").write_bytes(b"x")
+        (root / "Subbed Movie 2020" / "Movie.2020.en.srt").write_text(
+            "1\n00:00:01,000 --> 00:00:02,000\nhi\n")
+        (root / "Bare Movie 2020" / "Bare Movie 2020.mkv").write_bytes(
+            tiny_mkv(0x02))
+        (root / "Embedded Movie.mkv").write_bytes(tiny_mkv(0x11))
+        (root / "Test Show" / "S01E01.mkv").write_bytes(b"x")
+        (root / "Test Show" / "S01E02.mkv").write_bytes(b"x")
+        (root / "Test Show" / "S01E02.English.srt").write_text("1\n")
+
+        check("a sidecar is found next to its video",
+              sidecar_subtitles(
+                  root / "Subbed Movie 2020" / "Movie.2020.1080p.mkv") != [])
+        check("a video without sidecars finds none",
+              sidecar_subtitles(root / "Test Show" / "S01E01.mkv") == [])
+
+        # the container parsers read tiny hand-built Matroska/MP4 files;
+        # ffprobe is patched out so the check does not depend on the host
+        with patch("utils.subtitle_check._ffprobe_subtitles",
+                   return_value=None):
+            check("a matroska subtitle track is detected",
+                  _mkv_has_subtitle_track(str(root / "Embedded Movie.mkv"))
+                  is True)
+            check("a matroska audio track is not a subtitle",
+                  _mkv_has_subtitle_track(
+                      str(root / "Bare Movie 2020" / "Bare Movie 2020.mkv"))
+                  is False)
+            missing, note = video_subtitle_state(
+                root / "Bare Movie 2020" / "Bare Movie 2020.mkv")
+            check("a video with nothing is reported missing",
+                  missing and "embedded" in note)
+            covered, _ = video_subtitle_state(
+                root / "Subbed Movie 2020" / "Movie.2020.1080p.mkv")
+            check("a sidecar covers its video", not covered)
+
+        mp4 = root / "Tiny.tx3g.mp4"
+        mp4.write_bytes(tiny_mp4(b"tx3g"))
+        plain = root / "Tiny.aac.mp4"
+        plain.write_bytes(tiny_mp4(b"mp4a"))
+        check("an mp4 subtitle entry is detected",
+              _mp4_has_subtitle_track(str(mp4)) is True)
+        check("an mp4 audio entry is not a subtitle",
+              _mp4_has_subtitle_track(str(plain)) is False)
+
+        # the health report rows
+        db = Database(root / "library.db")
+        with db.conn:
+            cur = db.conn.execute(
+                "INSERT INTO media(path, title, media_type, year, video_path) "
+                "VALUES(?, ?, 'movie', ?, ?)",
+                (str(root / "Bare Movie 2020"), "Bare Movie", 2020,
+                 str(root / "Bare Movie 2020" / "Bare Movie 2020.mkv")))
+            bare_id = cur.lastrowid
+            db.conn.execute(
+                "INSERT INTO media(path, title, media_type, year, video_path) "
+                "VALUES(?, ?, 'movie', 2020, ?)",
+                (str(root / "Subbed Movie 2020"), "Subbed Movie",
+                 str(root / "Subbed Movie 2020" / "Movie.2020.1080p.mkv")))
+            cur = db.conn.execute(
+                "INSERT INTO media(path, title, media_type, year) "
+                "VALUES(?, ?, 'series', 2020)",
+                (str(root / "Test Show"), "Test Show"))
+            series_id = cur.lastrowid
+            db.conn.executemany(
+                "INSERT INTO episodes(series_id, season, episode, path, name) "
+                "VALUES(?, ?, ?, ?, ?)",
+                [(series_id, 1, 1, str(root / "Test Show" / "S01E01.mkv"),
+                  "Pilot"),
+                 (series_id, 1, 2, str(root / "Test Show" / "S01E02.mkv"),
+                  None),
+                 (series_id, 1, 3, str(root / "gone.mkv"), "Deleted")])
+
+        rows = db.subtitle_report()
+        db.close()
+        ids = {r["id"] for r in rows}
+        check("the bare movie is reported", bare_id in ids)
+        check("the sidecar movie and episode are not reported",
+              len(rows) == 2)
+        ep_rows = [r for r in rows if r["media_type"] == "series"]
+        check("only the subtitle-less episode is reported",
+              len(ep_rows) == 1 and ep_rows[0]["detail"].startswith("S01E01"))
+        check("a movie row explains itself",
+              all(r["detail"] == "no external or embedded subtitles"
+                  for r in rows if r["media_type"] == "movie"))
+        check("a gone file is not reported again",
+              all(not r["detail"].startswith("S01E03") for r in rows))
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def ui_checks(target: Path) -> None:
     image_utils.ensure_placeholder(config.PLACEHOLDER_PATH)
     config.THUMB_CACHE_DIR = target / "thumbs"
@@ -2497,7 +2634,7 @@ def ui_checks(target: Path) -> None:
     check("ui smoke completed", results == ["done"])
 
 
-SECTIONS = ("parse", "story", "scan", "organizer", "ui")
+SECTIONS = ("parse", "story", "scan", "organizer", "subtitle", "ui")
 
 
 def main() -> None:
@@ -2529,6 +2666,8 @@ def main() -> None:
         scanner_db_checks(target)
     if run("organizer"):
         organizer_checks(target)
+    if run("subtitle"):
+        subtitle_checks()
     if args.ui and run("ui"):
         ui_checks(target)
     elif wanted == {"ui"}:
